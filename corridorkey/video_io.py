@@ -4,6 +4,7 @@ import glob
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -63,11 +64,25 @@ def raw_clip_name(path: str | os.PathLike) -> str:
     return name
 
 
+_FRAME_EXTS = (".exr", ".png", ".jpg", ".jpeg")
+
+
+def _natural_key(path: str):
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
 def frame_paths(frame_dir: str | os.PathLike) -> list[str]:
-    paths: list[str] = []
-    for ext in ("*.exr", "*.png", "*.jpg", "*.jpeg"):
-        paths.extend(glob.glob(os.path.join(str(frame_dir), ext)))
-    return sorted(paths)
+    """Image frames in ``frame_dir``, in natural (numeric-aware) order.
+
+    Extensions are matched case-insensitively (``.PNG``/``.EXR`` too) and
+    unpadded numbering (``f_2`` before ``f_10``) keeps temporal order.
+    """
+    frame_dir = str(frame_dir)
+    paths = [os.path.join(frame_dir, n) for n in os.listdir(frame_dir)
+             if n.lower().endswith(_FRAME_EXTS)
+             and os.path.isfile(os.path.join(frame_dir, n))]
+    return sorted(paths, key=_natural_key)
 
 
 def ceil_to_multiple(x: int, q: int) -> int:
