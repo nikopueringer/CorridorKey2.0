@@ -68,7 +68,7 @@ class LayerNorm2d(nn.Module):
         # Cast weight to input dtype so F.rms_norm's fused kernel dispatches
         # (autocast keeps params fp32; mismatch blocks the fast path).
         w = self.weight.to(x.dtype) if self.weight is not None else None
-        x = F.rms_norm(x, (self.num_channels,), w, self.eps)
+        x = F.rms_norm(x, (self.num_channels,), w, self.eps).to(x.dtype)
         return x.permute(0, 3, 1, 2).contiguous()
 
 
@@ -87,8 +87,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Newer torch autocast returns fp32 from rms_norm; keep the input dtype.
         return F.rms_norm(x, self.normalized_shape,
-                           self.weight.to(x.dtype), self.eps)
+                           self.weight.to(x.dtype), self.eps).to(x.dtype)
 
 
 def icnr_init_(conv: nn.Conv2d, upscale_factor: int):
