@@ -8,4 +8,6 @@ einops>=0.8
 scipy>=1.16
 pillow>=11
 tqdm>=4.67
+torch==2.9.1
+torchvision==0.24.1
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd

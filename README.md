@@ -20,7 +20,7 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
-environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
+environment (3.12 is the latest recommended) with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
 This package was tested with:
 
 ```
