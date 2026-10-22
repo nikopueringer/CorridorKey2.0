@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from . import color_utils as cu
@@ -447,6 +448,12 @@ def load_runtime_checkpoint(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
 
 
+_BF16_WEIGHT_MODULES = (
+    nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
+    nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d,
+)
+
+
 @contextlib.contextmanager
 def _skip_param_init():
     """Random parameter initializers as no-ops while the model is built.
@@ -509,6 +516,11 @@ def load_model(paths: RuntimePaths, device: str = "cuda", *,
             f"missing={train_missing[:8]} unexpected={train_unexpected[:8]}")
     print(f"  loaded weights; omitted frozen foundation tensors={len(missing)}")
     model.eval()
+    model.requires_grad_(False)
+    for module in model.modules():
+        if isinstance(module, _BF16_WEIGHT_MODULES):
+            for p in module.parameters(recurse=False):
+                p.data = p.data.to(torch.bfloat16)
     del ckpt
     return model
 
