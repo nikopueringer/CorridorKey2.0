@@ -18,9 +18,12 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 
 ## Setup
 
-You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
-for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
-environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
+You need either an NVIDIA GPU (currently RTX 30-series or newer) or an Apple
+Silicon Mac with an MPS-enabled PyTorch build, plus `ffmpeg` on your PATH. For
+NVIDIA, allow at least 4 GB of VRAM for footage up to 1440p or 6 GB for 4K. On
+Apple Silicon, 32 GB of unified memory is the practical baseline; smaller Macs
+should start with low-VRAM mode and short Hann windows. See
+[Long Clips And Low VRAM](#long-clips-and-low-vram).
 This package was tested with:
 
 ```
@@ -29,7 +32,9 @@ torchvision==0.24.1
 ```
 
 From the repository root, create an environment, install PyTorch and the
-remaining dependencies, and download the model weights (about 5 GB):
+remaining dependencies, and download the model weights (about 5 GB).
+
+NVIDIA CUDA:
 
 ```
 python -m venv venv
@@ -38,6 +43,24 @@ pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorc
 pip install -r requirements.txt
 python scripts/download_weights.py
 ```
+
+Apple Silicon (native arm64 Python; do not run the terminal under Rosetta):
+
+```
+python3 -m venv venv
+source venv/bin/activate
+pip install torch==2.9.1 torchvision==0.24.1
+pip install -r requirements.txt
+python scripts/download_weights.py
+python infer.py --device mps --help
+```
+
+MPS execution is strict: unsupported Metal operations raise an error rather
+than silently falling back to the CPU. `--device auto` (the default) chooses
+CUDA first and MPS second. Use `--device mps` to require Metal explicitly.
+Inference reports progress separately for foundation features, stage-1 neural
+blocks, and stage-2 output frames. On completion it prints both inference-only
+and total wall-clock runtime.
 
 The download script fetches:
 
@@ -56,7 +79,7 @@ The easiest way to run CorridorKey is to drag a clip, a frame-sequence folder,
 or a folder of clips onto the launcher in the repository root:
 
 - **Windows:** `CorridorKey_DRAG_CLIPS_HERE.bat`
-- **Linux:** `CorridorKey_DRAG_CLIPS_HERE.sh` (or run it in a terminal and drop
+- **Linux/macOS:** `CorridorKey_DRAG_CLIPS_HERE.sh` (or run it in a terminal and drop
   the clip into the terminal when asked)
 
 It walks you through the inference mode, outputs, and GPU memory profile, then
@@ -401,8 +424,9 @@ python infer.py \
 ## Long Clips And Low VRAM
 
 You normally do not need to set anything here: with no memory flags,
-CorridorKey measures the free memory on your GPU and picks the Hann window and
-low-VRAM mode for each clip. As a guide, this is roughly what it selects
+CorridorKey measures the accelerator memory budget and picks the Hann window
+and low-VRAM mode for each clip. The table below was measured on CUDA and is a
+rough starting point for MPS unified memory as well:
 (window as chunk/stride):
 
 | GPU memory | 720p | 1080p | 1440p | 4K |
@@ -421,7 +445,8 @@ frame, which gives up temporal context in stage 1 to save memory. Results
 remain good, with somewhat less frame-to-frame consistency than larger windows.
 
 These come from measurements on synthetic test clips; other software using the
-GPU reduces what is available. If you hit a CUDA out-of-memory error, pass
+GPU use by other applications reduces what is available. If you hit an
+accelerator out-of-memory error, pass
 `--low_vram` with a smaller `--hann_chunk` yourself.
 
 The normal path streams video and does not intentionally hold an entire long

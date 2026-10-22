@@ -4,9 +4,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# CorridorKey's MPS path is GPU-only. Unsupported operators must fail loudly
+# instead of silently crossing to the CPU.
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
 import numpy as np
 import torch
@@ -147,6 +152,126 @@ _VRAM_PEAK_GB = {
 }
 _VRAM_MARGIN_SCALE = 1.1
 _VRAM_MARGIN_GB = 0.3
+# MPS currently materializes attention score buffers that CUDA SDPA avoids.
+# Calibrated conservatively from the 61-frame 1920x1024 reference run:
+# 19.2 GB CUDA-model estimate versus approximately 52 GB MPS peak.
+_MPS_PEAK_SCALE = 2.75
+
+
+class _InlineProgress:
+    """Dependency-free progress display that only rewrites the current line."""
+
+    def __init__(self, *, total: int, desc: str, unit: str):
+        self.total = max(0, int(total))
+        self.desc = desc.strip()
+        self.unit = unit
+        self.n = 0
+        self.started = time.perf_counter()
+        self.last_rendered = 0.0
+        self.detail = ""
+        self.visible = False
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        return (f"{hours:d}:{minutes:02d}:{seconds:02d}"
+                if hours else f"{minutes:02d}:{seconds:02d}")
+
+    def _render(self, *, force: bool = False) -> None:
+        now = time.perf_counter()
+        if not force and now - self.last_rendered < 0.2:
+            return
+        elapsed = now - self.started
+        fraction = min(1.0, self.n / self.total) if self.total else 1.0
+        rate = self.n / elapsed if elapsed > 0 else 0.0
+        remaining = ((self.total - self.n) / rate
+                     if rate > 0 and self.total > self.n else 0.0)
+        message = (
+            f"{self.desc}: {fraction * 100:5.1f}% "
+            f"({self.n}/{self.total} {self.unit}) | "
+            f"elapsed {self._duration(elapsed)}"
+        )
+        if self.total > self.n and rate > 0:
+            message += f" | ETA {self._duration(remaining)}"
+        if self.detail:
+            message += f" | {self.detail}"
+        try:
+            width = os.get_terminal_size(sys.stdout.fileno()).columns
+            message = message[:max(1, width - 1)]
+        except (OSError, ValueError):
+            pass
+        # CR returns to column zero; EL2 clears the entire current line. Unlike
+        # tqdm's nested cursor movement, this cannot create additional rows.
+        sys.stdout.write(f"\r\033[2K{message}")
+        sys.stdout.flush()
+        self.last_rendered = now
+        self.visible = True
+
+    def update(self, amount: int = 1) -> None:
+        self.n = min(self.total, self.n + int(amount))
+        self._render(force=self.n >= self.total)
+
+    def set_postfix_str(self, detail: str) -> None:
+        self.detail = str(detail)
+        self._render()
+
+    def close(self) -> None:
+        if self.visible:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self.visible = False
+
+
+def _inline_progress(*, total: int, desc: str, unit: str):
+    return _InlineProgress(total=total, desc=desc, unit=unit)
+
+
+def select_accelerator(requested: str = "auto") -> torch.device:
+    """Select a GPU backend. CPU execution and MPS CPU fallback are forbidden."""
+    requested = str(requested).lower()
+    if requested not in ("auto", "cuda", "mps"):
+        raise ValueError(f"unsupported accelerator {requested!r}")
+    if requested in ("auto", "cuda") and torch.cuda.is_available():
+        return torch.device("cuda")
+    if requested in ("auto", "mps") and torch.backends.mps.is_available():
+        # Setting this after torch import still documents and enforces the
+        # policy for subprocesses; PyTorch's default is already no fallback.
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+        return torch.device("mps")
+    if requested == "cuda":
+        raise RuntimeError("CUDA was requested, but no CUDA GPU is available.")
+    if requested == "mps":
+        built = torch.backends.mps.is_built()
+        raise RuntimeError(
+            "MPS was requested, but it is unavailable "
+            f"(PyTorch built with MPS support: {built}).")
+    raise RuntimeError("CorridorKey requires a CUDA or MPS GPU; CPU fallback is disabled.")
+
+
+def _inference_dtype(device: torch.device) -> torch.dtype:
+    # Match the trained CUDA runtime's dynamic range. Current MPS supports
+    # bf16 autocast, which avoids fp16 overflow on scene-linear HDR plates.
+    return torch.bfloat16
+
+
+def _autocast(device: torch.device):
+    return torch.autocast(device_type=device.type, dtype=_inference_dtype(device))
+
+
+def _empty_accelerator_cache(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def _interp(x: float, points) -> float:
@@ -187,16 +312,33 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
     return 1, 1, True, estimate
 
 
-def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # Memory this process already holds (the loaded model) is part of the budget.
-    budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
-    chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
+def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int,
+                    device: torch.device) -> None:
+    if device.type == "cuda":
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        # Memory this process already holds (the loaded model) is part of the budget.
+        budget_bytes = free_bytes + torch.cuda.memory_reserved(device)
+    elif device.type == "mps":
+        recommended = getattr(torch.mps, "recommended_max_memory", None)
+        if recommended is None:
+            raise RuntimeError(
+                "This PyTorch build cannot query the recommended MPS memory limit; "
+                "pass --low_vram and an explicit --hann_chunk.")
+        budget_bytes = recommended()
+    else:
+        raise RuntimeError(f"unsupported inference device: {device}")
+    budget_gb = budget_bytes / 2**30
+    profile_budget_gb = (
+        budget_gb / _MPS_PEAK_SCALE if device.type == "mps" else budget_gb)
+    chunk, stride, low_vram, estimate = select_vram_profile(
+        shape_hw, num_frames, profile_budget_gb)
+    displayed_estimate = estimate * (_MPS_PEAK_SCALE if device.type == "mps" else 1.0)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
-          f"(estimated peak {estimate:.1f} GB)")
-    if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
+          f"(estimated peak {displayed_estimate:.1f} GB"
+          f"{' on MPS' if device.type == 'mps' else ''})")
+    if displayed_estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
               "resolution. Inference may run out of memory.")
 
@@ -235,7 +377,8 @@ def load_runtime_checkpoint(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
 
 
-def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
+def load_model(paths: RuntimePaths, device: str | torch.device = "cuda") -> CorridorKeyV3:
+    device = torch.device(device)
     paths.validate()
     prepare_runtime_environment(paths)
     ckpt = load_runtime_checkpoint(paths.weights)
@@ -252,6 +395,7 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
 
     print(f"Loading CorridorKey v2 runtime weights: {paths.weights}")
     model = CorridorKeyV3(**cfg)
+    model._accelerator_device = device
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
     train_missing = [k for k in missing if not k.startswith("foundations.")]
     train_unexpected = [k for k in unexpected if not k.startswith("foundations.")]
@@ -265,27 +409,71 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
     return model
 
 
-def configure_low_vram_inference(model, cfg: InferenceConfig):
+def configure_low_vram_inference(model, cfg: InferenceConfig,
+                                 device: torch.device | None = None):
+    device = torch.device(device) if device is not None else model._accelerator_device
+    # CUDA SDPA does not materialize the score matrix, but current MPS SDPA
+    # does. A batch of 16 temporal windows at T=61 and 16x16 spatial tokens
+    # requests ~125 GB, while processing one window at a time requests ~7.8 GB.
+    window_batch = max(0, int(cfg.low_vram_swin_window_batch))
+    if device.type == "mps":
+        window_batch = 1
     model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
     for module in model.modules():
         name = module.__class__.__name__
         if name in ("SwiGLU", "FusionLinSwiglu"):
             module.inference_chunk_tokens = max(0, int(cfg.low_vram_mlp_chunk_tokens))
         if name == "SwinAttention3D":
-            module.inference_window_batch = max(0, int(cfg.low_vram_swin_window_batch))
+            module.inference_window_batch = window_batch
         if name == "CSwinAttention3D":
-            module.inference_strip_batch = max(0, int(cfg.low_vram_swin_window_batch))
+            module.inference_strip_batch = window_batch
         if name in ("FullSpatialAttention2D", "FullAttention3D"):
             module.inference_query_chunk_tokens = max(
                 0, int(cfg.low_vram_full_attn_query_chunk_tokens))
 
 
+def _area_resize_mps(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """MPS implementation of PyTorch's adaptive-average `area` resize.
+
+    MPS adaptive_avg_pool2d currently rejects non-divisible input/output
+    dimensions.  Constructing the same integer pooling bins as two separable
+    matrix multiplies keeps this operation entirely on the GPU and preserves
+    area-mode semantics.
+    """
+    out_h, out_w = size
+    in_h, in_w = x.shape[-2:]
+
+    def weights(in_size: int, out_size: int) -> torch.Tensor:
+        out_idx = torch.arange(out_size, device=x.device)
+        # Integer arithmetic avoids boundary drift when a rational bin edge is
+        # exactly integral (for example 7 * 128 / 28 == 32).
+        starts = torch.div(out_idx * in_size, out_size, rounding_mode="floor")
+        ends = torch.div(
+            (out_idx + 1) * in_size + out_size - 1,
+            out_size, rounding_mode="floor")
+        in_idx = torch.arange(in_size, device=x.device).unsqueeze(0)
+        included = (in_idx >= starts.unsqueeze(1)) & (in_idx < ends.unsqueeze(1))
+        return included.to(x.dtype) / (ends - starts).to(x.dtype).unsqueeze(1)
+
+    weight_h = weights(in_h, out_h)
+    weight_w = weights(in_w, out_w)
+    y = torch.einsum("oh,nchw->ncow", weight_h, x)
+    return torch.einsum("pw,ncow->ncop", weight_w, y)
+
+
+def _area_resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    if (x.device.type == "mps"
+            and (x.shape[-2] % size[0] or x.shape[-1] % size[1])):
+        return _area_resize_mps(x, size)
+    return F.interpolate(x, size=size, mode="area")
+
+
 def _build_foundation_inputs(rgb_bt: torch.Tensor):
     B, T, _, H, W = rgb_bt.shape
     flat = rgb_bt.reshape(B * T, 3, H, W)
-    rgb_radio = F.interpolate(flat, size=(H // 4, W // 4), mode="area")
+    rgb_radio = _area_resize(flat, (H // 4, W // 4))
     H_moge, W_moge = (H * 7) // 32, (W * 7) // 32
-    rgb_moge = F.interpolate(flat, size=(H_moge, W_moge), mode="area")
+    rgb_moge = _area_resize(flat, (H_moge, W_moge))
     return (
         rgb_radio.reshape(B, T, 3, H // 4, W // 4),
         rgb_moge.reshape(B, T, 3, H_moge, W_moge),
@@ -320,6 +508,8 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     state = None
+    progress = _inline_progress(
+        total=T_all, desc="    RVM features", unit="frame")
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
@@ -334,14 +524,17 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
                 rgb.reshape(Tc, 3, H, W), size=(H_e, W_e),
                 mode="bilinear", align_corners=False,
             ).reshape(1, Tc, 3, H_e, W_e).clamp(0.0, 1.0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            rgb_rvm = rgb_rvm.to(dtype=_inference_dtype(device))
+            with _autocast(device):
                 feats, state = model.foundations.rvm(rgb_rvm, state=state)
             feats_cpu = (feats.float().cpu() - mean) / std
             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
+            progress.update(Tc)
             del rgb, rgb_rvm, feats, feats_cpu, display
+    progress.close()
     out.flush()
     del out
-    torch.cuda.empty_cache()
+    _empty_accelerator_cache(device)
 
 
 @torch.no_grad()
@@ -372,6 +565,8 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
         chunks = iter_video_frame_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
+    progress = _inline_progress(
+        total=T_all, desc="    Foundation features", unit="frame")
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
@@ -381,9 +576,10 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             future = pool.submit(_next_or_none, chunks)
             t0, _model, display = item
             Tc = display.shape[0]
-            rgb = display.unsqueeze(0).to(device, non_blocking=True)
+            rgb = display.unsqueeze(0).to(
+                device, dtype=_inference_dtype(device), non_blocking=True)
             rgb_radio, rgb_moge = _build_foundation_inputs(rgb)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast(device):
                 ff = model.foundations(
                     rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                     rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -391,33 +587,37 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             moge_out[t0:t0 + Tc] = ff["moge"].float().cpu().numpy()
             if cradio_out is not None:
                 cradio_out[t0:t0 + Tc] = ff["cradio"].float().cpu().numpy()
+            progress.update(Tc)
             del rgb, rgb_radio, rgb_moge, ff, display
+    progress.close()
     moge_out.flush()
     del moge_out
     if cradio_out is not None:
         cradio_out.flush()
         del cradio_out
-    torch.cuda.empty_cache()
+    _empty_accelerator_cache(device)
     return paths
 
 
 def _phase1_setup(model, *, stage1_on_gpu: bool = True):
-    model.foundations.cuda()
+    device = model._accelerator_device
+    model.foundations.to(device)
     # Low-VRAM mode precomputes foundation features first, so stage 1 waits on CPU.
     if stage1_on_gpu:
-        model.stage1.cuda()
+        model.stage1.to(device)
     else:
         model.stage1.cpu()
     model.stage2.cpu()
-    torch.cuda.empty_cache()
+    _empty_accelerator_cache(device)
 
 
 def _phase2_setup(model):
+    device = model._accelerator_device
     model.foundations.cpu()
     model.stage1.cpu()
-    torch.cuda.empty_cache()
-    model.stage2.cuda()
-    torch.cuda.synchronize()
+    _empty_accelerator_cache(device)
+    model.stage2.to(device)
+    _synchronize(device)
 
 
 @torch.no_grad()
@@ -446,6 +646,32 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
     live_w = {}
     print(f"    Hann stage1: chunk={chunk}, stride={stride}, "
           f"windows={len(starts)}, baton_grid={w16}x{h16}")
+
+    tracked_blocks = list(model.stage1.enc_16) + list(model.stage1.body_64)
+    tracked_blocks += list(model.stage1.mid_16) + list(model.stage1.dec_16)
+    enc_blocks = len(model.stage1.enc_16)
+    other_blocks = len(tracked_blocks) - enc_blocks
+    frame_chunk = int(getattr(model.stage1, "low_vram_enc_frame_chunk", 0) or 0)
+
+    def block_calls(tc: int) -> int:
+        enc_passes = (
+            (tc + frame_chunk - 1) // frame_chunk
+            if frame_chunk > 0 and tc > frame_chunk else 1)
+        return enc_blocks * enc_passes + other_blocks
+
+    stage1_progress = _inline_progress(
+        total=sum(block_calls(min(t0 + chunk, T_all) - t0) for t0 in starts),
+        desc="    Stage 1 blocks", unit="block")
+    def update_stage1_progress(_module, _inputs, _output):
+        stage1_progress.update(1)
+        # Forward hooks replace a module's output when they return a value.
+        # tqdm.update() returns a bool on refresh, so return None explicitly.
+        return None
+
+    hook_handles = [
+        block.register_forward_hook(update_stage1_progress)
+        for block in tracked_blocks
+    ]
 
     rvm_map = None
     if rvm_path is not None:
@@ -481,6 +707,8 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
         for i, t0 in enumerate(starts):
             t1 = min(t0 + chunk, T_all)
             Tc = t1 - t0
+            stage1_progress.set_postfix_str(
+                f"window {i + 1}/{len(starts)} frames {t0}:{t1}")
             model_chunk, display_chunk, review_chunk = reader.window(t0, t1)
             hint_cpu = torch.zeros(1, Tc, 1, H, W, dtype=torch.bfloat16)
             hint_quality_cpu = torch.zeros(1, Tc, dtype=torch.bfloat16)
@@ -505,14 +733,18 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                 for j, t_abs in enumerate(range(t0, t1)):
                     stage2_frame_cache[t_abs] = model_chunk[j]
 
-            rgb_c = model_chunk.unsqueeze(0).to(device, non_blocking=True)
-            hint_c = hint_cpu.to(device, non_blocking=True)
-            hint_quality_c = hint_quality_cpu.to(device, non_blocking=True)
+            compute_dtype = _inference_dtype(device)
+            rgb_c = model_chunk.unsqueeze(0).to(
+                device, dtype=compute_dtype, non_blocking=True)
+            hint_c = hint_cpu.to(device, dtype=compute_dtype, non_blocking=True)
+            hint_quality_c = hint_quality_cpu.to(
+                device, dtype=compute_dtype, non_blocking=True)
             ff = rgb_radio = rgb_moge = None
             if foundation_paths is None:
-                rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=True)
+                rgb_found = display_chunk.unsqueeze(0).to(
+                    device, dtype=compute_dtype, non_blocking=True)
                 rgb_radio, rgb_moge = _build_foundation_inputs(rgb_found)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with _autocast(device):
                     ff = model.foundations(
                         rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                         rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -528,7 +760,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             if rvm_map is not None:
                 rvm_feat = torch.from_numpy(np.asarray(rvm_map[t0:t1]).copy())
                 rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=True).float()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast(device):
                 s1 = model.stage1(
                     rgb_c, hint_c, moge_feat, cradio_feat=cradio_feat,
                     rvm_feat=rvm_feat, t_stride=1.0,
@@ -564,10 +796,12 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del rgb_c, hint_c, hint_quality_c, hint_cpu, hint_quality_cpu
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
-            print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
-        torch.cuda.synchronize()
+        _synchronize(device)
         flush_before(T_all + 1)
     finally:
+        for handle in hook_handles:
+            handle.remove()
+        stage1_progress.close()
         reader.close()
         if hint_reader is not None:
             hint_reader.close()
@@ -575,7 +809,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
     if baton_fp16 is not None:
         baton_fp16.flush()
     del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map
-    torch.cuda.empty_cache()
+    _empty_accelerator_cache(device)
 
 
 def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -733,6 +967,8 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
+    inference_started = time.perf_counter()
+    device = model._accelerator_device
     input_path = str(input_path)
     output_dir = str(output_dir)
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -763,7 +999,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
-        apply_auto_vram(cfg, (H, W), T_all)
+        apply_auto_vram(cfg, (H, W), T_all, device)
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
@@ -772,6 +1008,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
+    stage2_progress = None
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -839,8 +1076,17 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             if none_path(initial_hint_path) is not None else None
         )
         _phase1_setup(model, stage1_on_gpu=not cfg.low_vram)
-        if cfg.low_vram:
-            configure_low_vram_inference(model, cfg)
+        # MPS scaled-dot-product attention may materialize its full attention
+        # matrix. At HD resolutions, batching the per-frame /16 encoder over a
+        # long Hann window can therefore request well over 100 GB even when the
+        # actual model/activation working set is much smaller. These chunking
+        # knobs are mathematically exact and keep every compute chunk on MPS;
+        # they are independent of the CPU module staging used by --low_vram.
+        if cfg.low_vram or device.type == "mps":
+            configure_low_vram_inference(model, cfg, device=device)
+            if device.type == "mps" and not cfg.low_vram:
+                print("    MPS safe attention chunking enabled "
+                      "(GPU execution remains enabled)")
         rvm_path = cfg.temp_dir / f"{clip_name}_rvm_feat.f16"
         baton_path = cfg.temp_dir / f"{clip_name}_baton.f16"
         foundation_prefix = cfg.temp_dir / f"{clip_name}_foundation"
@@ -865,25 +1111,28 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader_kind=reader_kind)
             model.foundations.cpu()
             model.stage2.cpu()
-            model.stage1.cuda()
-            torch.cuda.empty_cache()
+            model.stage1.to(device)
+            _empty_accelerator_cache(device)
         else:
-            model.stage2.cuda()
+            model.stage2.to(device)
             model.stage2.eval()
-            torch.cuda.empty_cache()
+            _empty_accelerator_cache(device)
 
         stage2_batch = max(1, int(cfg.stage2_batch))
+        stage2_progress = _inline_progress(
+            total=T_all, desc="    Stage 2 + output", unit="frame")
 
         def write_prediction_batches(items):
             device = next(model.stage2.parameters()).device
             for offset in range(0, len(items), stage2_batch):
                 sub = items[offset:offset + stage2_batch]
                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
-                rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
+                rgb_t = rgb_t.unsqueeze(0).to(
+                    device, dtype=_inference_dtype(device), non_blocking=True)
                 baton_np = np.stack([item[1] for item in sub], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
                 baton_t = baton_t.to(device, non_blocking=True).float()
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.inference_mode(), _autocast(device):
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
@@ -892,6 +1141,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
+                stage2_progress.update(len(sub))
                 del logits, baton_t, rgb_t, baton_np, rendered
 
         hann_stage1_stream(
@@ -926,12 +1176,17 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader.close()
                 del baton
     finally:
+        if stage2_progress is not None:
+            stage2_progress.close()
         for writer in writers.values():
             writer.release()
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
-        torch.cuda.empty_cache()
+        _empty_accelerator_cache(device)
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
+    elapsed = time.perf_counter() - inference_started
+    print(f"  inference runtime: {elapsed / 60:.1f} min ({elapsed:.1f} s), "
+          f"{T_all / elapsed:.2f} frames/s")

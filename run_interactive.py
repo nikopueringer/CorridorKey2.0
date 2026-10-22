@@ -270,7 +270,15 @@ def main():
         # ======================================================================
         batch_clips = get_batch_clips(input_path)
         if not batch_clips:
-            print(f"{Colors.YELLOW}[ERROR] Directory contains no supported video clips or frame subdirectories: {input_path}{Colors.RESET}")
+            print(
+                f"{Colors.YELLOW}[ERROR] Directory contains no supported video clips "
+                f"or image-sequence folders: {input_path}\n"
+                "Image sequences must be placed inside a subdirectory named "
+                "'input', using this layout:\n"
+                "  <sequence-folder>/input/<frame files>\n"
+                "Pass or drag <sequence-folder> to this launcher, not the input/ "
+                f"directory itself.{Colors.RESET}"
+            )
             sys.exit(1)
             
         print(f"Found {Colors.GREEN}{len(batch_clips)}{Colors.RESET} clips to process in batch.")
@@ -548,9 +556,11 @@ def main():
                 env["HF_HUB_OFFLINE"] = "1"
                 env["TRANSFORMERS_OFFLINE"] = "1"
                 
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-                for line in process.stdout:
-                    print(line, end="")
+                # Inherit the terminal directly. Reading text through PIPE
+                # enables universal-newline translation, which turns the
+                # inference progress display's carriage returns into newlines
+                # and makes every refresh scroll on macOS terminals.
+                process = subprocess.Popen(cmd, env=env)
                 process.wait()
                 
                 if process.returncode == 0:
@@ -922,9 +932,9 @@ def main():
                 env["HF_HUB_OFFLINE"] = "1"
                 env["TRANSFORMERS_OFFLINE"] = "1"
                 
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-                for line in process.stdout:
-                    print(line, end="")
+                # Keep stdout/stderr attached to the user's terminal so inline
+                # carriage-return progress updates remain on one line.
+                process = subprocess.Popen(cmd, env=env)
                 process.wait()
                 
                 if process.returncode == 0:
