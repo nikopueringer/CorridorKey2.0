@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,6 +112,10 @@ class InferenceConfig:
     low_vram: bool = False
     # Pick hann_chunk/hann_stride/low_vram per clip from free GPU memory.
     auto_vram: bool = False
+    # Set by auto-VRAM: estimate of the chosen profile, and the estimate that
+    # any retry after an OOM must stay below.
+    vram_estimate_gb: float | None = None
+    vram_ceiling_gb: float | None = None
     low_vram_foundation_chunk: int = 4
     low_vram_mlp_chunk_tokens: int = 65536
     low_vram_enc_frame_chunk: int = 1
@@ -146,7 +152,13 @@ _VRAM_PEAK_GB = {
     )),
 }
 _VRAM_MARGIN_SCALE = 1.1
-_VRAM_MARGIN_GB = 0.3
+# Fixed headroom for other GPU processes and allocator slack.
+_VRAM_HEADROOM_GB = 1.5
+_VRAM_HEADROOM_FRAC = 0.05
+
+
+def _vram_headroom_gb(total_gb: float) -> float:
+    return max(_VRAM_HEADROOM_GB, _VRAM_HEADROOM_FRAC * total_gb)
 
 
 def _interp(x: float, points) -> float:
@@ -169,34 +181,61 @@ def estimate_peak_vram_gb(megapixels: float, frames: int, low_vram: bool) -> flo
     return _interp(frames, zip(chunks, per_chunk))
 
 
-def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
+def select_vram_profile(shape_hw, num_frames: int, budget_gb: float,
+                        headroom_gb: float, ceiling_gb: float | None = None):
     """Largest Hann window that fits `budget_gb`, as (chunk, stride, low_vram, estimate).
 
     Bigger windows give better temporal consistency, and low-VRAM mode is
     exact, so a larger low-VRAM window is preferred over a smaller normal one.
-    Falls back to a single-frame window when nothing is estimated to fit.
+    Profiles estimated at `ceiling_gb` or more are skipped. Falls back to a
+    single-frame window when nothing is estimated to fit.
     """
     megapixels = shape_hw[0] * shape_hw[1] / 1e6
+    estimate = 0.0
     for chunk in reversed(_VRAM_PEAK_GB[True][0]):
         for low_vram in (False, True):
             if chunk not in _VRAM_PEAK_GB[low_vram][0]:
                 continue
             estimate = estimate_peak_vram_gb(megapixels, min(chunk, num_frames), low_vram)
-            if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB <= budget_gb:
+            if ceiling_gb is not None and estimate >= ceiling_gb:
+                continue
+            if estimate * _VRAM_MARGIN_SCALE + headroom_gb <= budget_gb:
                 return chunk, max(1, chunk // 2), low_vram, estimate
     return 1, 1, True, estimate
 
 
+def _read_vram_budget_gb() -> tuple[float, float]:
+    """(budget, total) in GiB; budget is free memory plus what this process holds.
+
+    Reads twice a second apart and keeps the lower value, since another process
+    may still be releasing memory at startup.
+    """
+    gc.collect()
+    torch.cuda.empty_cache()
+    readings = []
+    for i in range(2):
+        if i:
+            time.sleep(1.0)
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        readings.append((free_bytes + torch.cuda.memory_reserved()) / 2**30)
+    if max(readings) - min(readings) > 1.0:
+        print(f"  [WARNING] GPU free memory is changing ({readings[0]:.1f} -> "
+              f"{readings[1]:.1f} GB); another process is using this GPU.")
+    return min(readings), total_bytes / 2**30
+
+
 def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # Memory this process already holds (the loaded model) is part of the budget.
-    budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
-    chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
+    budget_gb, total_gb = _read_vram_budget_gb()
+    headroom_gb = _vram_headroom_gb(total_gb)
+    chunk, stride, low_vram, estimate = select_vram_profile(
+        shape_hw, num_frames, budget_gb, headroom_gb, cfg.vram_ceiling_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
+    cfg.vram_estimate_gb = estimate
+    margin_gb = budget_gb - (estimate * _VRAM_MARGIN_SCALE + headroom_gb)
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
-          f"(estimated peak {estimate:.1f} GB)")
-    if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
+          f"(estimated peak {estimate:.1f} GB, margin {margin_gb:+.1f} GB)")
+    if margin_gb < 0:
         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
               "resolution. Inference may run out of memory.")
 
@@ -731,8 +770,26 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
 
 
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
-                  writer_cfg: WriterConfig, *, initial_hint_path: str | None,
-                  hint_video_path: str | None):
+                  writer_cfg: WriterConfig, **kwargs):
+    """Run inference; with cfg.auto_vram, an OOM restarts the clip with a cheaper profile."""
+    while True:
+        try:
+            return _run_inference_once(
+                model, input_path, output_dir, cfg, writer_cfg, **kwargs)
+        except torch.OutOfMemoryError:
+            if not cfg.auto_vram or (cfg.hann_chunk, cfg.low_vram) == (1, True):
+                raise
+            cfg.vram_ceiling_gb = cfg.vram_estimate_gb
+            print(f"  [AUTO VRAM] Out of memory at hann_chunk={cfg.hann_chunk}, "
+                  f"low_vram={cfg.low_vram}; retrying with a smaller profile.")
+        # Past the except block, so the traceback no longer pins GPU tensors.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _run_inference_once(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                        writer_cfg: WriterConfig, *, initial_hint_path: str | None,
+                        hint_video_path: str | None):
     input_path = str(input_path)
     output_dir = str(output_dir)
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
