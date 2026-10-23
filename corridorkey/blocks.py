@@ -979,11 +979,7 @@ def _sdpa_with_region_groups(
             cache[key] = idx
         return idx
 
-    # SDPA returns the autocast dtype, which can differ from q's.
-    out_dtype = q.dtype
-    if torch.is_autocast_enabled(q.device.type):
-        out_dtype = torch.get_autocast_dtype(q.device.type)
-    out = torch.zeros_like(q, dtype=out_dtype)
+    out = torch.zeros_like(q)
     if full_idx:
         win_idx = _batched_windows(full_idx)
         out.index_copy_(
