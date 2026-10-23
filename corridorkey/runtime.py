@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,6 +126,10 @@ class InferenceConfig:
     # Auto VRAM: read the memory table measured for the optimized path
     # (bf16 weights + lean activations) instead of the shipped one.
     auto_vram_optimized: bool = False
+    # Set by auto-VRAM: estimate of the chosen profile, and the estimate that
+    # any retry after an OOM must stay below.
+    vram_estimate_gb: float | None = None
+    vram_ceiling_gb: float | None = None
     low_vram_foundation_chunk: int = 4
     low_vram_mlp_chunk_tokens: int = 65536
     low_vram_enc_frame_chunk: int = 1
@@ -198,7 +204,13 @@ _VRAM_PEAK_GB = {
     )),
 }
 _VRAM_MARGIN_SCALE = 1.1
-_VRAM_MARGIN_GB = 0.3
+# Fixed headroom for other GPU processes and allocator slack.
+_VRAM_HEADROOM_GB = 1.5
+_VRAM_HEADROOM_FRAC = 0.05
+
+
+def _vram_headroom_gb(total_gb: float) -> float:
+    return max(_VRAM_HEADROOM_GB, _VRAM_HEADROOM_FRAC * total_gb)
 
 # The same table for the --optimized path (bf16 Linear/Conv weights, lean
 # activations), measured on an RTX 6000 Ada
@@ -270,24 +282,28 @@ def estimate_peak_vram_gb(megapixels: float, frames: int, low_vram: bool,
 
 
 def select_vram_profile(shape_hw, num_frames: int, budget_gb: float,
-                        table=None, margin=None):
+                        table=None, margin=None, ceiling_gb: float | None = None):
     """Largest Hann window that fits `budget_gb`, as (chunk, stride, low_vram, estimate).
 
     Bigger windows give better temporal consistency, and low-VRAM mode is
     exact, so a larger low-VRAM window is preferred over a smaller normal one.
-    Falls back to a single-frame window when nothing is estimated to fit.
     `table`/`margin` default to the shipped `_VRAM_PEAK_GB` and margins;
     `margin` is (scale, extra GiB), or a dict of those keyed by low_vram.
+    Profiles estimated at `ceiling_gb` or more are skipped. Falls back to a
+    single-frame window when nothing is estimated to fit.
     """
     table = table or _VRAM_PEAK_GB
     margin = margin or (_VRAM_MARGIN_SCALE, _VRAM_MARGIN_GB)
     megapixels = shape_hw[0] * shape_hw[1] / 1e6
+    estimate = 0.0
     for chunk in reversed(table[True][0]):
         for low_vram in (False, True):
             if chunk not in table[low_vram][0]:
                 continue
             estimate = estimate_peak_vram_gb(
                 megapixels, min(chunk, num_frames), low_vram, table)
+            if ceiling_gb is not None and estimate >= ceiling_gb:
+                continue
             scale, extra_gb = margin[low_vram] if isinstance(margin, dict) else margin
             if estimate * scale + extra_gb <= budget_gb:
                 return chunk, max(1, chunk // 2), low_vram, estimate
@@ -358,27 +374,70 @@ def reserve_activation_arena(nbytes: int) -> int:
     return nbytes
 
 
+# Fixed headroom floor for other GPU processes and allocator slack.
+_VRAM_HEADROOM_GB = 1.5
+_VRAM_HEADROOM_FRAC = 0.05
+
+
+def _vram_headroom_gb(total_gb: float) -> float:
+    return max(_VRAM_HEADROOM_GB, _VRAM_HEADROOM_FRAC * total_gb)
+
+
+def _read_vram_budget_gb() -> tuple[float, float]:
+    """(budget, total) in GiB for CUDA; reads twice a second apart.
+
+    Keeps the lower value to avoid being misled by another process still
+    releasing memory at startup.
+    """
+    gc.collect()
+    torch.cuda.empty_cache()
+    readings = []
+    for i in range(2):
+        if i:
+            time.sleep(1.0)
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        readings.append((free_bytes + torch.cuda.memory_reserved()) / 2**30)
+    if max(readings) - min(readings) > 1.0:
+        print(f"  [WARNING] GPU free memory is changing ({readings[0]:.1f} -> "
+              f"{readings[1]:.1f} GB); another process is using this GPU.")
+    return min(readings), total_bytes / 2**30
+
+
 _MPS_ESTIMATE_SCALE = 1.5
 
 
 def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cuda") -> None:
-    budget_gb = memory_budget_gb(device)
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        budget_gb, total_gb = _read_vram_budget_gb()
+        headroom_gb = _vram_headroom_gb(total_gb)
+    else:
+        budget_gb = memory_budget_gb(device)
+        headroom_gb = _VRAM_HEADROOM_GB
     # CUDA reference peaks understate MPS memory usage (larger attention
     # intermediates, unified-memory pressure from other allocations) and
     # recommended_max_memory() returns virtual address space rather than the
     # actual MPS watermark ceiling. Deflate the effective budget so the window
     # selector is conservative enough to avoid MPS OOM.
-    effective_budget_gb = budget_gb / _MPS_ESTIMATE_SCALE if torch.device(device).type == "mps" else budget_gb
+    effective_budget_gb = budget_gb / _MPS_ESTIMATE_SCALE if dev.type == "mps" else budget_gb
     table = margin = None
     if cfg.auto_vram_optimized:
         table = _VRAM_PEAK_GB_OPTIMIZED
-        expandable = (expandable_segments_active()
-                      if torch.device(device).type == "cuda" else False)
+        expandable = expandable_segments_active() if dev.type == "cuda" else False
         margin = optimized_vram_margin(shape_hw[0] * shape_hw[1] / 1e6, expandable)
+    # Incorporate headroom into the margin's extra_gb floor.
+    if margin is None:
+        margin = (_VRAM_MARGIN_SCALE, headroom_gb)
+    elif isinstance(margin, dict):
+        margin = {k: (s, max(e, headroom_gb)) for k, (s, e) in margin.items()}
+    else:
+        margin = (margin[0], max(margin[1], headroom_gb))
     chunk, stride, low_vram, estimate = select_vram_profile(
-        shape_hw, num_frames, effective_budget_gb, table, margin)
+        shape_hw, num_frames, effective_budget_gb, table, margin,
+        ceiling_gb=cfg.vram_ceiling_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
-    if torch.device(device).type == "mps" and low_vram:
+    cfg.vram_estimate_gb = estimate
+    if dev.type == "mps" and low_vram:
         # CUDA-sized batches retain much larger attention intermediates on MPS.
         # This applies only to automatic memory selection. Explicit Hann or
         # low-VRAM mode retains the user's batch settings.
@@ -392,7 +451,6 @@ def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cud
                 setattr(cfg, name, min(current, limit))
         if budget_gb < 6:
             # Small unified-memory Macs need smaller *spatial* batches too.
-            # These controls preserve attention token sets and model precision.
             native_attention = native_attention_available()
             for name, limit in (
                 ("low_vram_foundation_chunk", 1),
@@ -403,13 +461,13 @@ def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cud
                 current = getattr(cfg, name)
                 if current > 0:
                     setattr(cfg, name, min(current, limit))
-    estimate_label = "CUDA reference peak" if torch.device(device).type == "mps" else "estimated peak"
+    estimate_label = "CUDA reference peak" if dev.type == "mps" else "estimated peak"
+    scale, extra_gb = margin[low_vram] if isinstance(margin, dict) else margin
+    margin_gb = effective_budget_gb - (estimate * scale + extra_gb)
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
-          f"({estimate_label} {estimate:.1f} GB)")
-    margin = margin or (_VRAM_MARGIN_SCALE, _VRAM_MARGIN_GB)
-    scale, extra_gb = margin[low_vram] if isinstance(margin, dict) else margin
-    if estimate * scale + extra_gb > effective_budget_gb:
+          f"({estimate_label} {estimate:.1f} GB, margin {margin_gb:+.1f} GB)")
+    if margin_gb < 0:
         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
               "resolution. Inference may run out of memory.")
 
@@ -1473,6 +1531,28 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
+    """Run inference; with cfg.auto_vram on CUDA, an OOM restarts with a cheaper profile."""
+    kwargs = {"initial_hint_path": initial_hint_path, "hint_video_path": hint_video_path}
+    dev = model_device(model)
+    while True:
+        try:
+            return _run_inference_once(model, input_path, output_dir, cfg, writer_cfg, **kwargs)
+        except torch.OutOfMemoryError:
+            if not cfg.auto_vram or (cfg.hann_chunk, cfg.low_vram) == (1, True):
+                raise
+            if dev.type != "cuda":
+                raise
+            cfg.vram_ceiling_gb = cfg.vram_estimate_gb
+            print(f"  [AUTO VRAM] Out of memory at hann_chunk={cfg.hann_chunk}, "
+                  f"low_vram={cfg.low_vram}; retrying with a smaller profile.")
+        # Past the except block, so the traceback no longer pins GPU tensors.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _run_inference_once(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                        writer_cfg: WriterConfig, *, initial_hint_path: str | None,
+                        hint_video_path: str | None):
     device = model_device(model)
     input_path = str(input_path)
     output_dir = str(output_dir)
