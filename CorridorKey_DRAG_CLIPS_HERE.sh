@@ -3,13 +3,15 @@
 # and drop the clip into the terminal when asked.
 cd "$(dirname "$0")" || exit 1
 
-if [ -x "venv/bin/python" ]; then
-    PYTHON="venv/bin/python"
+if command -v uv >/dev/null 2>&1; then
+    uv run run_interactive.py "$@"
+elif [ -x ".venv/bin/python" ]; then
+    .venv/bin/python run_interactive.py "$@"
+elif [ -x "venv/bin/python" ]; then
+    venv/bin/python run_interactive.py "$@"
 else
-    PYTHON="python3"
+    python3 run_interactive.py "$@"
 fi
-
-"$PYTHON" run_interactive.py "$@"
 
 echo
 read -r -p "Press Enter to close."

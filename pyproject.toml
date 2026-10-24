@@ -1,0 +1,35 @@
+[project]
+name = "corridorkey"
+version = "2.0.0"
+description = "Corridor Key 2.0 for all your green and blue screen needs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "numpy>=1.26",
+    "opencv-python>=4.11",
+    "transformers>=4.57,<5",
+    "timm>=1.0",
+    "safetensors>=0.6",
+    "huggingface-hub>=0.36",
+    "einops>=0.8",
+    "scipy>=1.16",
+    "pillow>=11",
+    "tqdm>=4.67",
+    "utils3d @ https://github.com/EasternJournalist/utils3d/archive/83bfa5bda008803f6521ce9547f94023b8afeddd.zip",
+]
+
+[tool.uv]
+# Scripts run from the repository root; there is nothing to build or install.
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+torchvision = { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
