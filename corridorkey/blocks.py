@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .attention import sdpa
 from .rope import RoPE2D, RoPE3D, apply_rotary
 
 
@@ -68,7 +69,7 @@ class LayerNorm2d(nn.Module):
         # Cast weight to input dtype so F.rms_norm's fused kernel dispatches
         # (autocast keeps params fp32; mismatch blocks the fast path).
         w = self.weight.to(x.dtype) if self.weight is not None else None
-        x = F.rms_norm(x, (self.num_channels,), w, self.eps)
+        x = F.rms_norm(x, (self.num_channels,), w, self.eps).to(x.dtype)
         return x.permute(0, 3, 1, 2).contiguous()
 
 
@@ -87,8 +88,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Newer torch autocast returns fp32 from rms_norm; keep the input dtype.
         return F.rms_norm(x, self.normalized_shape,
-                           self.weight.to(x.dtype), self.eps)
+                           self.weight.to(x.dtype), self.eps).to(x.dtype)
 
 
 def icnr_init_(conv: nn.Conv2d, upscale_factor: int):
@@ -725,7 +727,7 @@ def _sdpa_with_region_ids(
     """
 
     if region_ids is None:
-        return F.scaled_dot_product_attention(
+        return sdpa(
             q, k, v, dropout_p=0.0, is_causal=False)
     if region_ids.shape != (q.shape[0], q.shape[2]):
         raise ValueError(
@@ -741,7 +743,7 @@ def _sdpa_with_region_ids(
         out.index_copy_(
             0,
             full_idx,
-            F.scaled_dot_product_attention(
+            sdpa(
                 q.index_select(0, full_idx),
                 k.index_select(0, full_idx),
                 v.index_select(0, full_idx),
@@ -774,7 +776,7 @@ def _sdpa_with_region_ids(
     for token_tuple, win_list in groups.items():
         win_idx = torch.tensor(win_list, device=q.device, dtype=torch.long)
         token_idx = torch.tensor(token_tuple, device=q.device, dtype=torch.long)
-        attn = F.scaled_dot_product_attention(
+        attn = sdpa(
             q.index_select(0, win_idx).index_select(2, token_idx),
             k.index_select(0, win_idx).index_select(2, token_idx),
             v.index_select(0, win_idx).index_select(2, token_idx),
@@ -878,7 +880,7 @@ def _sdpa_with_region_groups(
     groups: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
 ) -> torch.Tensor:
     if num_windows <= 0:
-        return F.scaled_dot_product_attention(
+        return sdpa(
             q, k, v, dropout_p=0.0, is_causal=False)
     if q.shape[0] % num_windows != 0:
         raise ValueError(
@@ -900,7 +902,7 @@ def _sdpa_with_region_groups(
         out.index_copy_(
             0,
             win_idx,
-            F.scaled_dot_product_attention(
+            sdpa(
                 q.index_select(0, win_idx),
                 k.index_select(0, win_idx),
                 v.index_select(0, win_idx),
@@ -915,7 +917,7 @@ def _sdpa_with_region_groups(
     for token_tuple, win_tuple in groups:
         win_idx = _batched_windows(win_tuple)
         token_idx = torch.tensor(token_tuple, device=q.device, dtype=torch.long)
-        attn = F.scaled_dot_product_attention(
+        attn = sdpa(
             q.index_select(0, win_idx).index_select(2, token_idx),
             k.index_select(0, win_idx).index_select(2, token_idx),
             v.index_select(0, win_idx).index_select(2, token_idx),
@@ -1142,7 +1144,7 @@ class SwinAttention2D(nn.Module):
             q_view = q.view(B_eff, nW, self.num_heads, N, self.head_dim)
             k_view = k.view(B_eff, nW, self.num_heads, N, self.head_dim)
             v_view = v.view(B_eff, nW, self.num_heads, N, self.head_dim)
-            attn = F.scaled_dot_product_attention(
+            attn = sdpa(
                 q_view, k_view, v_view,
                 attn_mask=attn_mask.unsqueeze(0).unsqueeze(2),
                 dropout_p=0.0, is_causal=False)
@@ -1159,11 +1161,11 @@ class SwinAttention2D(nn.Module):
             real = real.view(nH_w, w, nW_w, w).permute(0, 2, 1, 3).contiguous()
             per_win_mask = real.view(nH_w * nW_w, N)               # (nWin, N)
             attn_mask = per_win_mask.unsqueeze(0).expand(B, -1, -1).reshape(nW_total, 1, 1, N)
-            attn = F.scaled_dot_product_attention(q, k, v,
-                                                  attn_mask=attn_mask,
-                                                  dropout_p=0.0, is_causal=False)
+            attn = sdpa(q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=0.0, is_causal=False)
         else:
-            attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            attn = sdpa(q, k, v, dropout_p=0.0, is_causal=False)
 
         attn = self.attn_gate(gate_tokens, attn)
         attn = attn.transpose(1, 2).reshape(nW_total, N, C)
@@ -1310,10 +1312,10 @@ class HaloAttention2D(nn.Module):
             valid_u = valid.unfold(0, kh, b).unfold(1, kh, b)  # (nH, nW, kh, kh)
             valid_u = valid_u.reshape(nBlocks, N_kv)
             attn_mask = valid_u.unsqueeze(0).expand(B, -1, -1).reshape(B * nBlocks, 1, 1, N_kv)
-            attn = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask,
-                                                  dropout_p=0.0, is_causal=False)
+            attn = sdpa(Q, K, V, attn_mask=attn_mask,
+                        dropout_p=0.0, is_causal=False)
         else:
-            attn = F.scaled_dot_product_attention(Q, K, V, dropout_p=0.0, is_causal=False)
+            attn = sdpa(Q, K, V, dropout_p=0.0, is_causal=False)
 
         # 7. Unpack: (B·nBlocks, heads, b², D) → (B, Hp, Wp, C) → crop to (B, H, W, C)
         attn = self.attn_gate(q_tokens, attn)
@@ -1473,11 +1475,11 @@ class SwinAttention3D(nn.Module):
             elif region_ids is not None:
                 attn = _sdpa_with_region_ids(q, k, v, region_ids[start:end])
             elif pad_attn_mask is not None:
-                attn = F.scaled_dot_product_attention(
+                attn = sdpa(
                     q, k, v, attn_mask=pad_attn_mask[start:end],
                     dropout_p=0.0, is_causal=False)
             else:
-                attn = F.scaled_dot_product_attention(
+                attn = sdpa(
                     q, k, v, dropout_p=0.0, is_causal=False)
             attn = self.attn_gate(gate_tokens, attn)
             attn = attn.transpose(1, 2).reshape(end - start, N, C)
@@ -1569,11 +1571,11 @@ class SwinAttention3D(nn.Module):
             elif region_ids is not None:
                 attn = _sdpa_with_region_ids(q, k, v, region_ids[start:end])
             elif pad_attn_mask is not None:
-                attn = F.scaled_dot_product_attention(
+                attn = sdpa(
                     q, k, v, attn_mask=pad_attn_mask[start:end],
                     dropout_p=0.0, is_causal=False)
             else:
-                attn = F.scaled_dot_product_attention(
+                attn = sdpa(
                     q, k, v, dropout_p=0.0, is_causal=False)
             attn = self.attn_gate(gate_tokens[start:end], attn)
             attn = attn.transpose(1, 2).reshape(end - start, N, C)
@@ -1721,11 +1723,11 @@ class HaloAttention3D(nn.Module):
             # Tile over T (T always valid).
             valid_tiled = valid_u.unsqueeze(1).expand(-1, T, -1).reshape(nBlocks, N_kv)
             attn_mask = valid_tiled.unsqueeze(0).expand(B, -1, -1).reshape(B * nBlocks, 1, 1, N_kv)
-            attn = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask,
-                                                  dropout_p=0.0, is_causal=False)
+            attn = sdpa(Q, K, V, attn_mask=attn_mask,
+                        dropout_p=0.0, is_causal=False)
         else:
-            attn = F.scaled_dot_product_attention(Q, K, V,
-                                                  dropout_p=0.0, is_causal=False)
+            attn = sdpa(Q, K, V,
+                        dropout_p=0.0, is_causal=False)
 
         # 7. Unpack: (B·nBlocks, heads, T·bH·bW, D) → (B, T, H, W, C)
         attn = self.attn_gate(q_tokens, attn)
@@ -1800,7 +1802,7 @@ class AxialAttention2D(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        attn = sdpa(q, k, v, dropout_p=0.0, is_causal=False)
         attn = self.attn_gate(x_strips, attn)
         # (B·M, heads, N, head_dim) → (B·M, N, C)
         attn = attn.transpose(1, 2).reshape(-1, N, C)
@@ -1870,7 +1872,7 @@ class AxialAttention3D(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        attn = sdpa(q, k, v, dropout_p=0.0, is_causal=False)
         attn = self.attn_gate(x_strips, attn)
         attn = attn.transpose(1, 2).reshape(-1, N, C)
         attn = self.proj(attn)
@@ -1975,10 +1977,10 @@ class CSwinAttention2D(nn.Module):
         k_w = apply_rotary(k_w, cos_w, sin_w)
 
         # Attention along each axis.
-        attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
-                                                 dropout_p=0.0, is_causal=False)
-        attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
-                                                 dropout_p=0.0, is_causal=False)
+        attn_h = sdpa(q_h, k_h, v_h,
+                      dropout_p=0.0, is_causal=False)
+        attn_w = sdpa(q_w, k_w, v_w,
+                      dropout_p=0.0, is_causal=False)
 
         # Un-strip back to (B, H, W, head_group, D) and concat heads.
         # H-group: (B·W, h_heads, H, D) → (B, W, h_heads, H, D) → (B, H, W, h_heads, D)
@@ -2060,7 +2062,7 @@ class CSwinAttention3D(nn.Module):
                     k = self.k_norm(k)
                 q = apply_rotary(q, cos_h, sin_h)
                 k = apply_rotary(k, cos_h, sin_h)
-                out_h[start:end] = F.scaled_dot_product_attention(
+                out_h[start:end] = sdpa(
                     q, k, v, dropout_p=0.0, is_causal=False)
             attn_h = (out_h.reshape(B, W, h_heads, T, H, D)
                            .permute(0, 3, 4, 1, 2, 5)
@@ -2079,7 +2081,7 @@ class CSwinAttention3D(nn.Module):
                     k = self.k_norm(k)
                 q = apply_rotary(q, cos_w, sin_w)
                 k = apply_rotary(k, cos_w, sin_w)
-                out_w[start:end] = F.scaled_dot_product_attention(
+                out_w[start:end] = sdpa(
                     q, k, v, dropout_p=0.0, is_causal=False)
             attn_w = (out_w.reshape(B, H, w_heads, T, W, D)
                            .permute(0, 3, 1, 4, 2, 5)
@@ -2131,10 +2133,10 @@ class CSwinAttention3D(nn.Module):
         q_w = apply_rotary(q_w, cos_w, sin_w)
         k_w = apply_rotary(k_w, cos_w, sin_w)
 
-        attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
-                                                 dropout_p=0.0, is_causal=False)
-        attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
-                                                 dropout_p=0.0, is_causal=False)
+        attn_h = sdpa(q_h, k_h, v_h,
+                      dropout_p=0.0, is_causal=False)
+        attn_w = sdpa(q_w, k_w, v_w,
+                      dropout_p=0.0, is_causal=False)
 
         # Un-strip: H-group → (B, T, H, W, h_heads, D)
         attn_h = (attn_h.reshape(B, W, h_heads, T, H, D)
@@ -2210,13 +2212,13 @@ class FullAttention3D(nn.Module):
             attn = q.new_empty((B, self.num_heads, N, self.head_dim))
             for start in range(0, N, query_chunk):
                 end = min(start + query_chunk, N)
-                a = F.scaled_dot_product_attention(
+                a = sdpa(
                     q[:, :, start:end], k, v,
                     dropout_p=0.0, is_causal=False)
                 a = self.attn_gate(gate_tokens[:, start:end], a)
                 attn[:, :, start:end] = a
         else:
-            attn = F.scaled_dot_product_attention(
+            attn = sdpa(
                 q, k, v, dropout_p=0.0, is_causal=False)
             attn = self.attn_gate(gate_tokens, attn)
         attn = attn.transpose(1, 2).reshape(B, N, C)
@@ -2314,7 +2316,7 @@ class FullResolutionRecurrentMemorySite(nn.Module):
         cos, sin = self.rope.get_cos_sin(H, W, device=x_t.device)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        attn = F.scaled_dot_product_attention(
+        attn = sdpa(
             q, k, v, dropout_p=0.0, is_causal=False)
         attn = self.attn_gate(q_tokens, attn)
         attn = attn.transpose(1, 2).reshape(B, N, C)
@@ -2339,7 +2341,7 @@ class FullResolutionRecurrentMemorySite(nn.Module):
         cos, sin = self.rope.get_cos_sin(H, W, device=query_grid.device)
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        attn = F.scaled_dot_product_attention(
+        attn = sdpa(
             q, k, v, dropout_p=0.0, is_causal=False)
         attn = self.write_ca_gate(q_tokens, attn)
         attn = attn.transpose(1, 2).reshape(B, N, C)
@@ -2448,13 +2450,13 @@ class FullSpatialAttention2D(nn.Module):
             attn = q.new_empty((BT, self.num_heads, N, self.head_dim))
             for start in range(0, N, query_chunk):
                 end = min(start + query_chunk, N)
-                a = F.scaled_dot_product_attention(
+                a = sdpa(
                     q[:, :, start:end], k, v,
                     dropout_p=0.0, is_causal=False)
                 a = self.attn_gate(gate_tokens[:, start:end], a)
                 attn[:, :, start:end] = a
         else:
-            attn = F.scaled_dot_product_attention(
+            attn = sdpa(
                 q, k, v, dropout_p=0.0, is_causal=False)
             attn = self.attn_gate(gate_tokens, attn)
         attn = attn.transpose(1, 2).reshape(BT, N, C)
