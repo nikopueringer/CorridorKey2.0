@@ -20,6 +20,7 @@ from corridorkey.runtime import (
     run_inference,
 )
 from corridorkey.video_io import require_ffmpeg
+from corridorkey.device import configure_auto_memory, select_device
 
 
 def _parse_outputs(values):
@@ -117,8 +118,7 @@ def main():
                     default=2048)
     args = ap.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
+    device = select_device()
     require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
@@ -133,6 +133,8 @@ def main():
     )
     # With no explicit memory settings, pick them per clip from free GPU memory.
     auto_vram = args.hann_chunk is None and args.hann_stride is None and not args.low_vram
+    if auto_vram:
+        configure_auto_memory(device)
     hann_chunk = args.hann_chunk if args.hann_chunk is not None else 80
     hann_stride = args.hann_stride if args.hann_stride is not None else max(1, hann_chunk // 2)
     infer_cfg = InferenceConfig(
@@ -166,7 +168,7 @@ def main():
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
     )
-    model = load_model(paths, device="cuda")
+    model = load_model(paths, device=device)
     run_inference(
         model,
         args.input,

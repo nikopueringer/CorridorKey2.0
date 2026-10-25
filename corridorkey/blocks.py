@@ -931,6 +931,45 @@ def _sdpa_with_region_groups(
 # ---------------------------------------------------------------------------
 
 
+def _window_attention_batched(q, k, v, *, window_batch=0,
+                              attn_mask=None, region_ids=None,
+                              region_groups=None):
+    """Bound independent window batches without changing their token sets.
+
+    Cached shifted-window groups use indices within each image. Rebase them
+    into each chunk, including chunks crossing an image boundary.
+    """
+    count = q.shape[0]
+    step = window_batch if window_batch > 0 else count
+    out = torch.empty_like(q)
+    for start in range(0, count, step):
+        end = min(start + step, count)
+        qs, ks, vs = q[start:end], k[start:end], v[start:end]
+        if region_groups is not None:
+            num_windows, full_idx, groups = region_groups
+            if num_windows <= 0:
+                value = F.scaled_dot_product_attention(qs, ks, vs)
+            else:
+                if count % num_windows:
+                    raise ValueError("cached window count does not divide attention batch")
+                def rebase(indices):
+                    return tuple(i - start for i in range(start, end)
+                                 if i % num_windows in indices)
+                sliced = tuple((tokens, wins) for tokens, indices in groups
+                               if (wins := rebase(indices)))
+                value = _sdpa_with_region_groups(
+                    qs, ks, vs, end - start, rebase(full_idx), sliced)
+        elif attn_mask is not None:
+            value = F.scaled_dot_product_attention(
+                qs, ks, vs, attn_mask=attn_mask[start:end])
+        elif region_ids is not None:
+            value = _sdpa_with_region_ids(qs, ks, vs, region_ids[start:end])
+        else:
+            value = F.scaled_dot_product_attention(qs, ks, vs)
+        out[start:end] = value
+    return out
+
+
 class _QKVProj(nn.Module):
     """Fused QKV projection."""
 
@@ -1131,7 +1170,25 @@ class SwinAttention2D(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        if region_groups is not None:
+        window_batch = int(getattr(self, 'inference_window_batch', 0) or 0)
+        if window_batch > 0 and not self.training and nW_total > window_batch:
+            mask = None
+            if attn_mask is not None:
+                nW = int(attn_mask.shape[0])
+                if nW_total % nW:
+                    raise ValueError("attention mask windows do not divide q batch")
+                mask = attn_mask.unsqueeze(0).expand(
+                    nW_total // nW, -1, -1, -1).reshape(nW_total, 1, N, N)
+            elif has_pad and region_groups is None and region_ids is None:
+                real = torch.zeros(Hp, Wp, dtype=torch.bool, device=x.device)
+                real[:H, :W] = True
+                real = real.view(Hp // w, w, Wp // w, w).permute(0, 2, 1, 3)
+                mask = real.reshape(1, -1, N).expand(B, -1, -1)
+                mask = mask.reshape(nW_total, 1, 1, N)
+            attn = _window_attention_batched(
+                q, k, v, window_batch=window_batch, attn_mask=mask,
+                region_ids=region_ids, region_groups=region_groups)
+        elif region_groups is not None:
             attn = _sdpa_with_region_groups(q, k, v, *region_groups)
         elif attn_mask is not None:
             nW = int(attn_mask.shape[0])
@@ -1974,11 +2031,16 @@ class CSwinAttention2D(nn.Module):
         q_w = apply_rotary(q_w, cos_w, sin_w)
         k_w = apply_rotary(k_w, cos_w, sin_w)
 
-        # Attention along each axis.
-        attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
-                                                 dropout_p=0.0, is_causal=False)
-        attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
-                                                 dropout_p=0.0, is_causal=False)
+        # Independent strips can share the existing low-memory window limit.
+        strip_batch = int(getattr(self, 'inference_strip_batch', 0) or 0)
+        if strip_batch > 0 and not self.training:
+            attn_h = _window_attention_batched(q_h, k_h, v_h, window_batch=strip_batch)
+            attn_w = _window_attention_batched(q_w, k_w, v_w, window_batch=strip_batch)
+        else:
+            attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
+                                                     dropout_p=0.0, is_causal=False)
+            attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
+                                                     dropout_p=0.0, is_causal=False)
 
         # Un-strip back to (B, H, W, head_group, D) and concat heads.
         # H-group: (B·W, h_heads, H, D) → (B, W, h_heads, H, D) → (B, H, W, h_heads, D)
@@ -2444,13 +2506,20 @@ class FullSpatialAttention2D(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         gate_tokens = x.reshape(BT, N, C)
+        native_attention = None
+        if query_chunk > 0 and not self.training and N > query_chunk and x.device.type == 'mps':
+            from .mps_attention import prepare
+            native_attention = prepare(q, k, v)
         if query_chunk > 0 and not self.training and N > query_chunk:
             attn = q.new_empty((BT, self.num_heads, N, self.head_dim))
             for start in range(0, N, query_chunk):
                 end = min(start + query_chunk, N)
-                a = F.scaled_dot_product_attention(
-                    q[:, :, start:end], k, v,
-                    dropout_p=0.0, is_causal=False)
+                if native_attention is not None:
+                    a = native_attention(start, end)
+                else:
+                    a = F.scaled_dot_product_attention(
+                        q[:, :, start:end], k, v,
+                        dropout_p=0.0, is_causal=False)
                 a = self.attn_gate(gate_tokens[:, start:end], a)
                 attn[:, :, start:end] = a
         else:

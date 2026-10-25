@@ -18,6 +18,54 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 
 ## Setup
 
+### Apple Silicon Mac
+
+Use native arm64 Python 3.12, a macOS version with Metal bfloat16 support
+(macOS 14 or later), and `ffmpeg` on your `PATH`. From the repository root:
+
+```sh
+python3.12 -m venv venv
+source venv/bin/activate
+pip install torch==2.9.1 torchvision==0.24.1
+pip install -r requirements.txt
+python scripts/download_weights.py
+python infer.py --input /path/to/clip.mp4 --output_dir /path/to/output
+```
+
+The existing CLI automatically selects Metal when CUDA is unavailable.
+Metal uses synchronous uploads and the CPU area-resize operator for dimensions
+unsupported by Metal's adaptive pooling. The CUDA execution path is unchanged.
+The Mac dependencies select a tested OpenCV decoder to avoid corrupted final
+rows in YUV444 video with the older Apple Silicon wheel.
+
+On macOS 15 or later, optional native MPSGraph attention reduces attention
+memory and improves throughput. With Apple's command-line developer tools
+installed, build it in the same Python environment before running inference:
+
+```sh
+python scripts/build_mps_attention.py
+```
+
+Rebuild after changing PyTorch or moving the environment. A missing or
+incompatible library uses the bounded PyTorch path. Set
+`CORRIDORKEY_MPS_NATIVE_ATTENTION=0` to disable native attention for comparisons.
+
+Automatic memory selection reserves headroom for unified memory and reduces
+foundation, attention, and MLP batches on smaller Macs. Existing explicit Hann
+and low-VRAM settings retain control. Metal allocation limits remain enabled;
+explicit `PYTORCH_MPS_HIGH_WATERMARK_RATIO` / `PYTORCH_MPS_LOW_WATERMARK_RATIO`
+settings are respected.
+
+A 302-frame 3840×2160 clip completed on a 24 GiB M2 with native attention:
+3 h 58 min end to end, 11.96 GiB sampled inference-process peak (excluding
+separate FFmpeg processes). Both output videos decoded all 302 frames at native
+resolution. Model weights and resolution were preserved. This remains a slow
+offline workflow; automatic settings can use shorter temporal context.
+Native attention can introduce floating-point differences, and identical
+CUDA/Metal pixels are not guaranteed.
+
+### NVIDIA CUDA
+
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
 environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
