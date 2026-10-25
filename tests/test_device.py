@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
+import os
 
 import pytest
 import torch
@@ -64,6 +65,60 @@ def test_mps_budget_never_negative(monkeypatch):
     monkeypatch.setattr(torch.mps, 'driver_allocated_memory', lambda: 30 * 2**30)
     monkeypatch.setattr(torch.mps, 'current_allocated_memory', lambda: 2 * 2**30)
     assert device.memory_budget_gb('mps') == 0
+
+
+def test_auto_mps_profile_bounds_4k_batches(monkeypatch):
+    from corridorkey.runtime import InferenceConfig, apply_auto_vram
+    monkeypatch.setattr(torch.mps, 'recommended_max_memory', lambda: 52 * 2**30)
+    monkeypatch.setattr(torch.mps, 'driver_allocated_memory', lambda: 3 * 2**30)
+    monkeypatch.setattr(torch.mps, 'current_allocated_memory', lambda: 2 * 2**30)
+    cfg = InferenceConfig(auto_vram=True)
+    apply_auto_vram(cfg, (2176, 3840), 302, 'mps')
+    assert (cfg.hann_chunk, cfg.hann_stride, cfg.low_vram) == (8, 4, True)
+    assert cfg.low_vram_full_attn_query_chunk_tokens == 512
+    assert cfg.low_vram_swin_window_batch == 4
+    assert cfg.low_vram_mlp_chunk_tokens == 16384
+
+
+def test_auto_cuda_profile_keeps_original_batches(monkeypatch):
+    from corridorkey.runtime import InferenceConfig, apply_auto_vram
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda dev: (12 * 2**30, 16 * 2**30))
+    monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda dev: 2 * 2**30)
+    cfg = InferenceConfig(auto_vram=True)
+    apply_auto_vram(cfg, (2176, 3840), 302, 'cuda')
+    assert (cfg.hann_chunk, cfg.hann_stride, cfg.low_vram) == (8, 4, True)
+    assert cfg.low_vram_full_attn_query_chunk_tokens == 2048
+    assert cfg.low_vram_swin_window_batch == 16
+    assert cfg.low_vram_mlp_chunk_tokens == 65536
+
+
+def test_small_mps_auto_profile_bounds_foundations_and_spatial_attention(monkeypatch):
+    from corridorkey.runtime import InferenceConfig, apply_auto_vram
+    monkeypatch.setattr(torch.mps, 'recommended_max_memory', lambda: 18 * 2**30)
+    monkeypatch.setattr(torch.mps, 'driver_allocated_memory', lambda: 3 * 2**30)
+    monkeypatch.setattr(torch.mps, 'current_allocated_memory', lambda: 2 * 2**30)
+    cfg = InferenceConfig(auto_vram=True)
+    apply_auto_vram(cfg, (2176, 3840), 302, 'mps')
+    assert (cfg.hann_chunk, cfg.hann_stride, cfg.low_vram) == (1, 1, True)
+    assert cfg.low_vram_foundation_chunk == 1
+    assert cfg.low_vram_full_attn_query_chunk_tokens == 128
+    assert cfg.low_vram_swin_window_batch == 1
+    assert cfg.low_vram_mlp_chunk_tokens == 4096
+
+
+def test_auto_memory_defaults_preserve_explicit_environment(monkeypatch):
+    high = 'PYTORCH_MPS_HIGH_WATERMARK_RATIO'
+    low = 'PYTORCH_MPS_LOW_WATERMARK_RATIO'
+    monkeypatch.delenv(high, raising=False)
+    monkeypatch.delenv(low, raising=False)
+    device.configure_auto_memory('cuda')
+    assert high not in os.environ and low not in os.environ
+    device.configure_auto_memory('mps')
+    assert (os.environ[high], os.environ[low]) == ('0.5', '0.4')
+    monkeypatch.setenv(high, '0.3')
+    monkeypatch.delenv(low)
+    device.configure_auto_memory('mps')
+    assert os.environ[high] == '0.3' and low not in os.environ
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason='Apple GPU required')

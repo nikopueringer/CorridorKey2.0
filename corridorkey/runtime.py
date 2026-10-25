@@ -193,9 +193,34 @@ def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cud
     budget_gb = memory_budget_gb(device)
     chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
+    if torch.device(device).type == "mps" and low_vram:
+        # CUDA-sized batches retain much larger attention intermediates on MPS.
+        # This applies only to automatic memory selection. Explicit Hann or
+        # low-VRAM mode retains the user's batch settings.
+        for name, limit in (
+            ("low_vram_full_attn_query_chunk_tokens", 512),
+            ("low_vram_swin_window_batch", 4),
+            ("low_vram_mlp_chunk_tokens", 16384),
+        ):
+            current = getattr(cfg, name)
+            if current > 0:
+                setattr(cfg, name, min(current, limit))
+        if budget_gb < 6:
+            # Small unified-memory Macs need smaller *spatial* batches too.
+            # These controls preserve attention token sets and model precision.
+            for name, limit in (
+                ("low_vram_foundation_chunk", 1),
+                ("low_vram_full_attn_query_chunk_tokens", 128),
+                ("low_vram_swin_window_batch", 1),
+                ("low_vram_mlp_chunk_tokens", 4096),
+            ):
+                current = getattr(cfg, name)
+                if current > 0:
+                    setattr(cfg, name, min(current, limit))
+    estimate_label = "CUDA reference peak" if torch.device(device).type == "mps" else "estimated peak"
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
-          f"(estimated peak {estimate:.1f} GB)")
+          f"({estimate_label} {estimate:.1f} GB)")
     if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
               "resolution. Inference may run out of memory.")
@@ -279,13 +304,14 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
 
 def configure_low_vram_inference(model, cfg: InferenceConfig):
     model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
+    spatial_batches = model_device(model).type == "mps"
     for module in model.modules():
         name = module.__class__.__name__
         if name in ("SwiGLU", "FusionLinSwiglu"):
             module.inference_chunk_tokens = max(0, int(cfg.low_vram_mlp_chunk_tokens))
-        if name == "SwinAttention3D":
+        if name == "SwinAttention3D" or (spatial_batches and name == "SwinAttention2D"):
             module.inference_window_batch = max(0, int(cfg.low_vram_swin_window_batch))
-        if name == "CSwinAttention3D":
+        if name == "CSwinAttention3D" or (spatial_batches and name == "CSwinAttention2D"):
             module.inference_strip_batch = max(0, int(cfg.low_vram_swin_window_batch))
         if name in ("FullSpatialAttention2D", "FullAttention3D"):
             module.inference_query_chunk_tokens = max(
@@ -580,6 +606,9 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del rgb_c, hint_c, hint_quality_c, hint_cpu, hint_quality_cpu
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
+            if device.type == "mps":
+                # Release unused Metal buffers between overlapping windows.
+                empty_cache(device)
             print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
         synchronize(device)
         flush_before(T_all + 1)

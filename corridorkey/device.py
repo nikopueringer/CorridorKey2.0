@@ -1,6 +1,8 @@
 """GPU selection and memory operations for CUDA and Apple Metal."""
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -18,6 +20,18 @@ def model_device(model) -> torch.device:
     if hasattr(model, "_runtime_device"):
         return torch.device(model._runtime_device)
     return next(model.foundations.parameters()).device
+
+
+def configure_auto_memory(device) -> None:
+    """Set CLI auto-mode limits before the first Metal allocation."""
+    if torch.device(device).type != "mps":
+        return
+    high = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
+    low = "PYTORCH_MPS_LOW_WATERMARK_RATIO"
+    # Leave an explicit PyTorch memory configuration under the user's control.
+    if high not in os.environ and low not in os.environ:
+        os.environ[high] = "0.5"
+        os.environ[low] = "0.4"
 
 
 def area_resize(tensor: torch.Tensor, size) -> torch.Tensor:
@@ -52,7 +66,7 @@ def memory_budget_gb(device) -> float:
     if device.type == "mps":
         # CUDA measurements understate some Metal intermediates. Keep headroom
         # within Metal's recommended working set, including resident weights.
-        return max(0.0, (0.5 * torch.mps.recommended_max_memory()
+        return max(0.0, (0.25 * torch.mps.recommended_max_memory()
                         - torch.mps.driver_allocated_memory()
                         + torch.mps.current_allocated_memory()) / 2**30)
     raise RuntimeError(f"Unsupported inference device: {device}")
