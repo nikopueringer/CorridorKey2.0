@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from . import color_utils as cu
 from .model import CorridorKeyV3
 from .device import area_resize, empty_cache, memory_budget_gb, model_device, synchronize
+from .mps_attention import available as native_attention_available
 from .video_io import (
     ExrSequenceWriter,
     ThreadedVideoWriter,
@@ -208,11 +209,12 @@ def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cud
         if budget_gb < 6:
             # Small unified-memory Macs need smaller *spatial* batches too.
             # These controls preserve attention token sets and model precision.
+            native_attention = native_attention_available()
             for name, limit in (
                 ("low_vram_foundation_chunk", 1),
-                ("low_vram_full_attn_query_chunk_tokens", 128),
-                ("low_vram_swin_window_batch", 1),
-                ("low_vram_mlp_chunk_tokens", 4096),
+                ("low_vram_full_attn_query_chunk_tokens", 512 if native_attention else 128),
+                ("low_vram_swin_window_batch", 4 if native_attention else 1),
+                ("low_vram_mlp_chunk_tokens", 16384 if native_attention else 4096),
             ):
                 current = getattr(cfg, name)
                 if current > 0:
@@ -305,6 +307,8 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
 def configure_low_vram_inference(model, cfg: InferenceConfig):
     model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
     spatial_batches = model_device(model).type == "mps"
+    if spatial_batches and native_attention_available():
+        print("  Native MPSGraph attention enabled for chunked full-spatial layers", flush=True)
     for module in model.modules():
         name = module.__class__.__name__
         if name in ("SwiGLU", "FusionLinSwiglu"):

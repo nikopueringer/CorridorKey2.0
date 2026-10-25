@@ -92,8 +92,10 @@ def test_auto_cuda_profile_keeps_original_batches(monkeypatch):
     assert cfg.low_vram_mlp_chunk_tokens == 65536
 
 
-def test_small_mps_auto_profile_bounds_foundations_and_spatial_attention(monkeypatch):
+@pytest.mark.parametrize('native_attention', [False, True])
+def test_small_mps_auto_profile_bounds_foundations_and_spatial_attention(monkeypatch, native_attention):
     from corridorkey.runtime import InferenceConfig, apply_auto_vram
+    monkeypatch.setattr('corridorkey.runtime.native_attention_available', lambda: native_attention)
     monkeypatch.setattr(torch.mps, 'recommended_max_memory', lambda: 18 * 2**30)
     monkeypatch.setattr(torch.mps, 'driver_allocated_memory', lambda: 3 * 2**30)
     monkeypatch.setattr(torch.mps, 'current_allocated_memory', lambda: 2 * 2**30)
@@ -101,9 +103,9 @@ def test_small_mps_auto_profile_bounds_foundations_and_spatial_attention(monkeyp
     apply_auto_vram(cfg, (2176, 3840), 302, 'mps')
     assert (cfg.hann_chunk, cfg.hann_stride, cfg.low_vram) == (1, 1, True)
     assert cfg.low_vram_foundation_chunk == 1
-    assert cfg.low_vram_full_attn_query_chunk_tokens == 128
-    assert cfg.low_vram_swin_window_batch == 1
-    assert cfg.low_vram_mlp_chunk_tokens == 4096
+    assert cfg.low_vram_full_attn_query_chunk_tokens == (512 if native_attention else 128)
+    assert cfg.low_vram_swin_window_batch == (4 if native_attention else 1)
+    assert cfg.low_vram_mlp_chunk_tokens == (16384 if native_attention else 4096)
 
 
 def test_auto_memory_defaults_preserve_explicit_environment(monkeypatch):

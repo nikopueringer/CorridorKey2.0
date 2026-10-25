@@ -41,3 +41,4 @@ tmp/
 # Local / studio-specific files
 path_mappings.json
 .claude/
+corridorkey/native/build/

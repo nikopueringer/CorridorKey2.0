@@ -2506,13 +2506,20 @@ class FullSpatialAttention2D(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         gate_tokens = x.reshape(BT, N, C)
+        native_attention = None
+        if query_chunk > 0 and not self.training and N > query_chunk and x.device.type == 'mps':
+            from .mps_attention import prepare
+            native_attention = prepare(q, k, v)
         if query_chunk > 0 and not self.training and N > query_chunk:
             attn = q.new_empty((BT, self.num_heads, N, self.head_dim))
             for start in range(0, N, query_chunk):
                 end = min(start + query_chunk, N)
-                a = F.scaled_dot_product_attention(
-                    q[:, :, start:end], k, v,
-                    dropout_p=0.0, is_causal=False)
+                if native_attention is not None:
+                    a = native_attention(start, end)
+                else:
+                    a = F.scaled_dot_product_attention(
+                        q[:, :, start:end], k, v,
+                        dropout_p=0.0, is_causal=False)
                 a = self.attn_gate(gate_tokens[:, start:end], a)
                 attn[:, :, start:end] = a
         else:
