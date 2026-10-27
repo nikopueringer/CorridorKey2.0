@@ -1,0 +1,26 @@
+[package]
+name = "corridorkey-io"
+description = "Keying whole clips: video / frame-directory input, ffmpeg and EXR output, around the corridorkey-ml pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wgpu", "cuda"]
+# CubeCL runtimes, forwarded to the compute crates
+wgpu = ["corridorkey-core/wgpu", "corridorkey-base/wgpu", "corridorkey-ml/wgpu"]
+cpu = ["corridorkey-core/cpu", "corridorkey-base/cpu", "corridorkey-ml/cpu"]
+cuda = ["corridorkey-core/cuda", "corridorkey-base/cuda", "corridorkey-ml/cuda"]
+hip = ["corridorkey-core/hip", "corridorkey-base/hip", "corridorkey-ml/hip"]
+
+[dependencies]
+corridorkey-core = { workspace = true, features = ["compute"] }
+corridorkey-base = { workspace = true, default-features = false }
+corridorkey-ml = { workspace = true, default-features = false }
+burn-tensor.workspace = true
+half.workspace = true
+image.workspace = true
+exr.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+nvml-wrapper.workspace = true

@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/corridorkey-core",
+    "crates/corridorkey-base",
+    "crates/corridorkey-ml",
+    "crates/corridorkey-io",
+    "crates/corridorkey-cli",
+    "crates/corridorkey-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+corridorkey-core = { path = "crates/corridorkey-core" }
+corridorkey-base = { path = "crates/corridorkey-base" }
+corridorkey-ml = { path = "crates/corridorkey-ml" }
+corridorkey-io = { path = "crates/corridorkey-io" }
+
+# Compute & Tensors
+# `persistence`: autotune results (and kernel caches) survive the process, in `~/.cache/cubecl`.
+# Without it every launch re-tunes every matmul / attention shape (65–91 s cold on the RTX 2070).
+cubecl = { version = "0.11.3", default-features = false, features = ["std", "stdlib", "persistence"] }
+burn-tensor = { version = "0.22.1", default-features = false, features = ["std", "autotune", "extension"] }
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["std", "autotune"] }
+# For naming attention strategies explicitly (autotune candidates); the version Burn 0.22 uses.
+cubek-attention = { version = "0.3.1", default-features = false }
+safetensors = "0.8.0"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
+# GPU memory (free memory for the window size, peak memory in benchmarks): NVIDIA's management
+# library, loaded at run time (absent on other vendors)
+nvml-wrapper = "0.13.0"
+# Frame-directory input and EXR output (corridorkey-io)
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+exr = "1.74.2"
+
+# CLI & assets
+clap = { version = "4.6.7", features = ["derive", "cargo", "env"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+sha2 = "0.10.9"
+md-5 = "0.10.6"
+base64 = "0.22.1"
+hex = "0.4.3"
+anyhow = "1.0.104"
+tracing-subscriber = "0.3.23"
+
+# Python bindings (corridorkey-py)
+pyo3 = "0.30.1"
+numpy = "0.30.0"
+
+# Utilities
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+num-traits = "0.2.19"
+tracing = "0.1.44"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+
+# From dsp-kitchen: wgpu-core's lock tracing (debug assertions only) aborts at device shutdown, and
+# wgpu-types' debug assertions turn on the Vulkan validation layer (SIGABRT in the NVIDIA driver
+# at exit). Debug builds run wgpu like release ones; our own checks stay on.
+[profile.dev.package.wgpu-core]
+debug-assertions = false
+
+[profile.dev.package.wgpu-types]
+debug-assertions = false

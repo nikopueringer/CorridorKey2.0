@@ -1,0 +1,46 @@
+[
+ {
+  "run": "Rust, CUDA, automatic window",
+  "engine": "Rust",
+  "runtime": "CUDA",
+  "window": 4,
+  "low_vram": false,
+  "wall_s": 92.05,
+  "status": "ok",
+  "frames": 48,
+  "fps": 0.521
+ },
+ {
+  "run": "Rust, WGPU, automatic window",
+  "engine": "Rust",
+  "runtime": "WGPU",
+  "window": 4,
+  "low_vram": false,
+  "wall_s": 249.59,
+  "status": "ok",
+  "frames": 48,
+  "fps": 0.192
+ },
+ {
+  "run": "PyTorch, its automatic settings",
+  "engine": "PyTorch",
+  "runtime": "CUDA",
+  "window": 8,
+  "low_vram": true,
+  "wall_s": 38.7,
+  "status": "out of memory",
+  "frames": 48,
+  "fps": null
+ },
+ {
+  "run": "PyTorch, window 4, low-VRAM mode",
+  "engine": "PyTorch",
+  "runtime": "CUDA",
+  "window": 4,
+  "low_vram": true,
+  "wall_s": 246.63,
+  "status": "ok",
+  "frames": 48,
+  "fps": 0.195
+ }
+]

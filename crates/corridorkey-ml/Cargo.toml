@@ -1,0 +1,29 @@
+[package]
+name = "corridorkey-ml"
+description = "CorridorKey networks (stage 1, stage 2, RVM, foundation backbones) on Burn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wgpu", "cuda"]
+wgpu = ["burn-tensor/wgpu", "burn-cubecl/wgpu", "corridorkey-base/wgpu"]
+cpu = ["burn-tensor/cpu", "burn-cubecl/cpu", "corridorkey-base/cpu"]
+cuda = ["burn-tensor/cuda", "burn-cubecl/cuda", "corridorkey-base/cuda"]
+hip = ["burn-tensor/rocm", "burn-cubecl/hip", "corridorkey-base/hip"]
+
+[dependencies]
+corridorkey-core = { workspace = true, features = ["compute"] }
+corridorkey-base = { workspace = true, default-features = false }
+burn-tensor.workspace = true
+burn-cubecl.workspace = true
+cubek-attention.workspace = true
+cubecl.workspace = true
+num-traits.workspace = true
+safetensors.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

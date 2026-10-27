@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "corridorkey-rs"
+version = "0.1.0"
+description = "CorridorKey 2.0 green-screen keying on the Rust engine (CubeCL / Burn, CUDA or wgpu chosen at run time)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[tool.maturin]
+module-name = "corridorkey_rs"
+features = ["extension-module"]

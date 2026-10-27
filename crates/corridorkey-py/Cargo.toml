@@ -1,0 +1,31 @@
+[package]
+name = "corridorkey-py"
+description = "Python bindings of the CorridorKey Rust engine (`import corridorkey_rs`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "corridorkey_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wgpu", "cuda"]
+## `pyo3/extension-module` for the wheel (maturin turns it on), off for `cargo test --workspace` to
+## avoid linker errors.
+extension-module = ["pyo3/extension-module"]
+## CubeCL runtimes (chosen at run time with `corridorkey_rs.set_runtime` or `runtime=`)
+wgpu = ["corridorkey-core/wgpu", "corridorkey-io/wgpu"]
+cpu = ["corridorkey-core/cpu", "corridorkey-io/cpu"]
+cuda = ["corridorkey-core/cuda", "corridorkey-io/cuda"]
+hip = ["corridorkey-core/hip", "corridorkey-io/hip"]
+
+[dependencies]
+corridorkey-core = { workspace = true, features = ["compute"] }
+corridorkey-base = { workspace = true, default-features = false }
+corridorkey-ml = { workspace = true, default-features = false }
+corridorkey-io = { workspace = true, default-features = false }
+pyo3.workspace = true
+numpy.workspace = true
+anyhow.workspace = true

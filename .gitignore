@@ -37,3 +37,14 @@ tmp/
 # Local / studio-specific files
 path_mappings.json
 .claude/
+.knowledge/
+data/
+benchmarks/results/
+# Committed: the benchmark charts and their data, and the memory model's measurements
+!docs/benchmarks/*.png
+!docs/benchmarks/data/
+!crates/corridorkey-io/data/
+
+# Rust
+target/
+.venv/

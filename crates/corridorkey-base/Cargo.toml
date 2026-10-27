@@ -1,0 +1,23 @@
+[package]
+name = "corridorkey-base"
+description = "CorridorKey image kernels on CubeCL: colour transfer, resize, pad / crop, despill, compositing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wgpu", "cuda"]
+wgpu = ["corridorkey-core/wgpu"]
+cpu = ["corridorkey-core/cpu"]
+cuda = ["corridorkey-core/cuda"]
+hip = ["corridorkey-core/hip"]
+
+[dependencies]
+corridorkey-core = { workspace = true, features = ["compute"] }
+cubecl.workspace = true
+num-traits.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+half.workspace = true

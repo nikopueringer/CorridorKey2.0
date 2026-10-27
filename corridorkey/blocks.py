@@ -781,7 +781,7 @@ def _sdpa_with_region_ids(
             dropout_p=0.0,
             is_causal=False,
         )
-        out_nlhd[win_idx[:, None], token_idx[None, :]] = attn.permute(0, 2, 1, 3)
+        out_nlhd[win_idx[:, None], token_idx[None, :]] = attn.permute(0, 2, 1, 3).to(dtype=out_nlhd.dtype)
     return out
 
 
@@ -897,17 +897,14 @@ def _sdpa_with_region_groups(
     out = torch.zeros_like(q)
     if full_idx:
         win_idx = _batched_windows(full_idx)
-        out.index_copy_(
-            0,
-            win_idx,
-            F.scaled_dot_product_attention(
-                q.index_select(0, win_idx),
-                k.index_select(0, win_idx),
-                v.index_select(0, win_idx),
-                dropout_p=0.0,
-                is_causal=False,
-            ),
-        )
+        attn = F.scaled_dot_product_attention(
+            q.index_select(0, win_idx),
+            k.index_select(0, win_idx),
+            v.index_select(0, win_idx),
+            dropout_p=0.0,
+            is_causal=False,
+        ).to(dtype=out.dtype)
+        out.index_copy_(0, win_idx, attn)
     if not groups:
         return out
 
@@ -922,7 +919,7 @@ def _sdpa_with_region_groups(
             dropout_p=0.0,
             is_causal=False,
         )
-        out_nlhd[win_idx[:, None], token_idx[None, :]] = attn.permute(0, 2, 1, 3)
+        out_nlhd[win_idx[:, None], token_idx[None, :]] = attn.permute(0, 2, 1, 3).to(dtype=out_nlhd.dtype)
     return out
 
 

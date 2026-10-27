@@ -1,0 +1,149 @@
+[
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 1,
+  "peak_gb": 2.66,
+  "fps": 6.636
+ },
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 2,
+  "peak_gb": 2.76,
+  "fps": 6.936
+ },
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 4,
+  "peak_gb": 2.76,
+  "fps": 6.95
+ },
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 8,
+  "peak_gb": 3.07,
+  "fps": 6.568
+ },
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 16,
+  "peak_gb": 3.87,
+  "fps": 5.702
+ },
+ {
+  "precision": "f16",
+  "size": "768x512",
+  "window": 24,
+  "peak_gb": 4.47,
+  "fps": 5.323
+ },
+ {
+  "precision": "f16",
+  "size": "1280x768",
+  "window": 1,
+  "peak_gb": 2.76,
+  "fps": 2.555
+ },
+ {
+  "precision": "f16",
+  "size": "1280x768",
+  "window": 2,
+  "peak_gb": 2.85,
+  "fps": 2.616
+ },
+ {
+  "precision": "f16",
+  "size": "1280x768",
+  "window": 4,
+  "peak_gb": 3.26,
+  "fps": 2.437
+ },
+ {
+  "precision": "f16",
+  "size": "1280x768",
+  "window": 8,
+  "peak_gb": 4.12,
+  "fps": 2.282
+ },
+ {
+  "precision": "f16",
+  "size": "1920x1080",
+  "window": 1,
+  "peak_gb": 3.27,
+  "fps": 0.936
+ },
+ {
+  "precision": "f16",
+  "size": "1920x1080",
+  "window": 2,
+  "peak_gb": 3.47,
+  "fps": 0.911
+ },
+ {
+  "precision": "f16",
+  "size": "1920x1080",
+  "window": 4,
+  "peak_gb": 4.38,
+  "fps": 0.879
+ },
+ {
+  "precision": "f16",
+  "size": "1920x1080",
+  "window": 8,
+  "peak_gb": 6.04,
+  "fps": 0.827
+ },
+ {
+  "precision": "f32",
+  "size": "768x512",
+  "window": 1,
+  "peak_gb": 5.26,
+  "fps": 2.347
+ },
+ {
+  "precision": "f32",
+  "size": "768x512",
+  "window": 2,
+  "peak_gb": 5.45,
+  "fps": 2.506
+ },
+ {
+  "precision": "f32",
+  "size": "768x512",
+  "window": 4,
+  "peak_gb": 5.45,
+  "fps": 2.669
+ },
+ {
+  "precision": "f32",
+  "size": "768x512",
+  "window": 8,
+  "peak_gb": 6.06,
+  "fps": 2.578
+ },
+ {
+  "precision": "f32",
+  "size": "1280x768",
+  "window": 1,
+  "peak_gb": 5.45,
+  "fps": 0.995
+ },
+ {
+  "precision": "f32",
+  "size": "1280x768",
+  "window": 2,
+  "peak_gb": 5.63,
+  "fps": 1.025
+ },
+ {
+  "precision": "f32",
+  "size": "1280x768",
+  "window": 4,
+  "peak_gb": 6.45,
+  "fps": 1.012
+ }
+]

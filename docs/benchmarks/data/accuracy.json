@@ -1,0 +1,52 @@
+[
+ {
+  "config": "PyTorch fp16 (fastest on this GPU)",
+  "engine": "PyTorch",
+  "mean_abs": 0.00124734751571746,
+  "p99_abs": 0.03714937932789325,
+  "max_abs": 0.24501341581344604,
+  "mean_codes16": 81.745,
+  "size": "768x512",
+  "frames": 8
+ },
+ {
+  "config": "Rust CUDA f16",
+  "engine": "Rust",
+  "mean_abs": 0.00022025521442969875,
+  "p99_abs": 0.006148734018206595,
+  "max_abs": 0.04145801067352295,
+  "mean_codes16": 14.434,
+  "size": "768x512",
+  "frames": 8
+ },
+ {
+  "config": "Rust CUDA f32",
+  "engine": "Rust",
+  "mean_abs": 9.320410781842857e-07,
+  "p99_abs": 2.512099221348759e-05,
+  "max_abs": 0.0002505779266357422,
+  "mean_codes16": 0.061,
+  "size": "768x512",
+  "frames": 8
+ },
+ {
+  "config": "Rust WGPU f16",
+  "engine": "Rust",
+  "mean_abs": 0.0005637787010878507,
+  "p99_abs": 0.011008756458759303,
+  "max_abs": 0.09362137317657471,
+  "mean_codes16": 36.947,
+  "size": "768x512",
+  "frames": 8
+ },
+ {
+  "config": "Rust WGPU f32",
+  "engine": "Rust",
+  "mean_abs": 1.8723760907727038e-06,
+  "p99_abs": 4.7206878662109375e-05,
+  "max_abs": 0.00034052133560180664,
+  "mean_codes16": 0.123,
+  "size": "768x512",
+  "frames": 8
+ }
+]

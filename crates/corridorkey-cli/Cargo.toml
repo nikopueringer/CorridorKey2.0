@@ -1,0 +1,38 @@
+[package]
+name = "corridorkey-cli"
+description = "Command line for CorridorKey: devices, model assets (download, check, convert), inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "corridorkey"
+path = "src/main.rs"
+
+[features]
+default = ["wgpu", "cuda"]
+# CubeCL runtimes (chosen at run time with --runtime among those compiled in)
+wgpu = ["corridorkey-core/wgpu", "corridorkey-base/wgpu", "corridorkey-ml/wgpu", "corridorkey-io/wgpu"]
+cpu = ["corridorkey-core/cpu", "corridorkey-base/cpu", "corridorkey-ml/cpu", "corridorkey-io/cpu"]
+cuda = ["corridorkey-core/cuda", "corridorkey-base/cuda", "corridorkey-ml/cuda", "corridorkey-io/cuda"]
+hip = ["corridorkey-core/hip", "corridorkey-base/hip", "corridorkey-ml/hip", "corridorkey-io/hip"]
+
+[dependencies]
+corridorkey-core = { workspace = true, features = ["compute"] }
+corridorkey-base = { workspace = true, default-features = false }
+corridorkey-ml = { workspace = true, default-features = false }
+corridorkey-io = { workspace = true, default-features = false }
+image.workspace = true
+cubecl.workspace = true
+safetensors.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+base64.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
