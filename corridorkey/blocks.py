@@ -926,6 +926,8 @@ def _shifted_region_groups_3d_cached(
 
 
 _REGION_INDEX_CACHE: dict | None = None
+# Whether a row band's QKV projection gives the whole frame's bits, per shape.
+_BAND_GEMM_EXACT: dict = {}
 
 
 def set_region_index_cache(enabled: bool) -> None:
@@ -1825,10 +1827,29 @@ class SwinAttention3D(nn.Module):
         band = bool(getattr(self, 'inference_qkv_band', False)) and self.qkv_dw is not None
 
         def qkv_rows(a: int, z: int) -> torch.Tensor:
+            # The band's projection is a GEMM with fewer rows than the
+            # frame's. cuBLAS may pick a different kernel for it (it does on
+            # an RTX 3090 for one band shape at 1080p), which changes the
+            # bits, so the band GEMM is used only where it matches the
+            # whole-frame GEMM on this input; otherwise each frame is
+            # projected whole and the band cut out.
+            key = (B, z - a, H, W, C, min(frame_chunk, T), x.dtype, x.device,
+                   torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
+            if key not in _BAND_GEMM_EXACT:
+                t1 = min(frame_chunk, T)
+                whole = self.qkv.qkv(x[:, :t1])[:, :, a:z].contiguous()
+                part = self.qkv.qkv(x[:, :t1, a:z])
+                _BAND_GEMM_EXACT[key] = (whole.dtype == part.dtype and torch.equal(
+                    whole.view(torch.int16) if whole.element_size() == 2 else whole.view(torch.int32),
+                    part.view(torch.int16) if part.element_size() == 2 else part.view(torch.int32)))
+                del whole, part
             grid = None
             for t_start in range(0, T, frame_chunk):
                 t_end = min(t_start + frame_chunk, T)
-                y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end, a:z]))
+                if _BAND_GEMM_EXACT[key]:
+                    y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end, a:z]))
+                else:
+                    y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end]))[:, :, a:z]
                 if grid is None:
                     grid = y.new_empty(B, T, z - a, W, 3 * C)
                 grid[:, t_start:t_end] = y
