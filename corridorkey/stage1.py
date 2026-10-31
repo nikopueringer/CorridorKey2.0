@@ -43,6 +43,9 @@ from .blocks import (
 from .pinned import HostBuffer
 from .rope import RoPE2D, RoPE3D
 
+# Frames per stem call under inference_stem_frame_chunk, per input shape.
+_STEM_CHUNKS: dict = {}
+
 
 def _skip_add_in_place(module, target: torch.Tensor, *others: torch.Tensor) -> bool:
     """Opt-in (`inference_inplace_skips`, inference only): whether a skip
@@ -764,6 +767,65 @@ class Stage1(nn.Module):
         tok = token.to(device=x.device, dtype=x.dtype).view(1, 1, -1, 1, 1)
         return torch.where(mask, tok, x)
 
+    def _stem_frames(self, rgb: torch.Tensor, hint: torch.Tensor, chunk: int) -> torch.Tensor:
+        B, T, _, H, W = rgb.shape
+        f_16 = None
+        for t0 in range(0, T, chunk):
+            t1 = min(t0 + chunk, T)
+            x_t = torch.cat([rgb[:, t0:t1], hint[:, t0:t1]], dim=2)
+            y = self.stem(x_t.reshape(B * (t1 - t0), 4, H, W))
+            del x_t
+            if f_16 is None:
+                f_16 = y.new_empty((B, T) + tuple(y.shape[1:]))
+            f_16[:, t0:t1] = y.view(B, t1 - t0, *y.shape[1:])
+            del y
+        return f_16
+
+    def _stem_window(self, rgb: torch.Tensor, hint: torch.Tensor) -> torch.Tensor:
+        """The stem in one call. Under bf16 autocast the conv casts its fp32
+        input to bf16, so concatenating straight into bf16 gives it the same
+        input without the fp32 concat."""
+        B, T, _, H, W = rgb.shape
+        if (rgb.is_cuda and rgb.dtype == hint.dtype == torch.float32
+                and torch.is_autocast_enabled("cuda")
+                and torch.get_autocast_dtype("cuda") == torch.bfloat16):
+            x = rgb.new_empty((B, T, 4, H, W), dtype=torch.bfloat16)
+            x[:, :, :3] = rgb
+            x[:, :, 3:] = hint
+        else:
+            x = torch.cat([rgb, hint], dim=2)
+        y = self.stem(x.view(B * T, 4, H, W))
+        del x
+        return y.view(B, T, *y.shape[1:])
+
+    def _stem_chunk(self, rgb: torch.Tensor, hint: torch.Tensor, chunk: int) -> int:
+        """Frames per stem call: the smallest count of at least `chunk` that
+        divides the window and gives the one call's bits, else the whole
+        window. cuDNN picks its algorithm by batch size too, and on some GPUs
+        (an RTX 5080 at 1024x1920, 48 frames) per-frame calls round
+        differently. Checked once per shape; `chunk` when the one call does
+        not fit."""
+        B, T, _, H, W = rgb.shape
+        if chunk >= T:
+            return T
+        key = (B, T, H, W, rgb.dtype, hint.dtype, rgb.device, chunk,
+               torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"),
+               torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+        found = _STEM_CHUNKS.get(key)
+        if found is None:
+            try:
+                ref = self._stem_window(rgb, hint)
+            except torch.cuda.OutOfMemoryError:
+                ref = None
+            found = chunk
+            if ref is not None:
+                bits = {2: torch.int16, 4: torch.int32}[ref.element_size()]
+                found = next((c for c in range(chunk, T) if T % c == 0 and torch.equal(
+                    self._stem_frames(rgb, hint, c).view(bits), ref.view(bits))), T)
+                del ref
+            _STEM_CHUNKS[key] = found
+        return found
+
     @staticmethod
     def _resolve_hint_quality(
         hint: torch.Tensor,
@@ -823,17 +885,9 @@ class Stage1(nn.Module):
             # Opt-in: concat and patchify a few frames at a time (the stem is
             # per frame), so the full-resolution concat and cuDNN's layout
             # buffers exist for one chunk instead of the whole window.
-            # Bit-identical: cuDNN keeps its algorithm for the smaller batch.
-            f_16 = None
-            for t0 in range(0, T, stem_chunk):
-                t1 = min(t0 + stem_chunk, T)
-                x_t = torch.cat([rgb[:, t0:t1], hint[:, t0:t1]], dim=2)
-                y = self.stem(x_t.reshape(B * (t1 - t0), 4, H, W))
-                del x_t
-                if f_16 is None:
-                    f_16 = y.new_empty((B, T) + tuple(y.shape[1:]))
-                f_16[:, t0:t1] = y.view(B, t1 - t0, *y.shape[1:])
-                del y
+            stem_chunk = self._stem_chunk(rgb, hint, stem_chunk)
+            f_16 = (self._stem_frames(rgb, hint, stem_chunk) if stem_chunk < T
+                    else self._stem_window(rgb, hint))
             del rgb, hint
         else:
             x_in = torch.cat([rgb, hint], dim=2).reshape(BT, 4, H, W)
