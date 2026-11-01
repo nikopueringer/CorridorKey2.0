@@ -7,6 +7,8 @@ import queue
 import shutil
 import subprocess
 import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -909,11 +911,14 @@ class ExrSequenceWriter:
     matching the layout convention of ThreadedVideoWriter/cv2. Values are
     written as-is: no clamping and no quantization. `dtype` selects the EXR
     pixel type: "half" (float16, VFX standard) or "float" (full float32).
+    `workers` > 1 (opt-in): compress and write that many frames at once, each
+    file still written whole by one thread from the same array, so the files
+    are the same; one ZIP-compressed 4K frame takes a core seconds.
     """
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
                  channels: int = 3, dtype: str = "half", maxsize: int = 2,
-                 frame_name: str = "frame"):
+                 frame_name: str = "frame", workers: int = 1):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
         self.dir_path = str(dir_path)
@@ -932,14 +937,23 @@ class ExrSequenceWriter:
         self.frame_idx = 0
         self.q = queue.Queue(maxsize=maxsize)
         self.err = None
+        self.workers = max(1, int(workers))
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
+    def _write_frame(self, out_path: str, frame: np.ndarray):
+        if not cv2.imwrite(out_path, frame, self.imwrite_params):
+            raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+
     def _worker(self):
+        pool = ThreadPoolExecutor(max_workers=self.workers) if self.workers > 1 else None
+        inflight = deque()
         try:
             while True:
                 item = self.q.get()
                 if item is None:
+                    while inflight:
+                        inflight.popleft().result()
                     self.q.task_done()
                     return
                 idx0, arr = item
@@ -952,11 +966,18 @@ class ExrSequenceWriter:
                     frame = np.ascontiguousarray(arr[j])
                     if frame.shape[-1] == 1:
                         frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+                    if pool is None:
+                        self._write_frame(out_path, frame)
+                        continue
+                    inflight.append(pool.submit(self._write_frame, out_path, frame))
+                    while len(inflight) >= 2 * self.workers:
+                        inflight.popleft().result()
                 self.q.task_done()
         except Exception as exc:
             self.err = exc
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
 
     def write_many(self, frames: np.ndarray):
         if self.err is not None:

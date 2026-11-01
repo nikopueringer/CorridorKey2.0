@@ -474,6 +474,11 @@ byte-identical and can be used on its own:
 - `--async_baton`: in low-VRAM mode, stage 1's windows run back to back on
   the GPU; each window's output is copied back and blended into the
   finished frames while the GPU runs the next one.
+- `--exr_workers N`: with `--output_format exr`, N frames per output are
+  compressed and written at once (default 1; `--optimized` uses a quarter of
+  the CPU cores, 2 to 8). Each file is still written whole by one thread from
+  the same pixels, so the files are the same. ZIP-compressing a 4K frame
+  takes a CPU core a few seconds, which otherwise sets the pace at 4K.
 
 These were checked on Volta, Turing, Ampere, Ada, Hopper and Blackwell GPUs:
 at the same window, `--optimized` writes the original's files on each. On
