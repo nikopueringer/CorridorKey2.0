@@ -200,6 +200,13 @@ def main():
                          "never runs (its neck and four heads; only its "
                          "encoder is used). Same output, 65 MiB less GPU "
                          "memory (32 MiB with --bf16_weights).")
+    ap.add_argument("--exr_workers", type=int, default=None,
+                    help="Threads per EXR output that compress and write "
+                         "frames at once (default 1; --optimized and --fast: "
+                         "a quarter of the CPU cores, 2 to 8). Each frame's "
+                         "file is still written whole by one thread, so the "
+                         "files are the same; ZIP-compressing a 4K frame "
+                         "takes a core seconds.")
     ap.add_argument("--fast", action="store_true",
                     help="--optimized plus more threads per video encoder "
                          "(half the CPU cores, up to 8). The keyed frames are "
@@ -212,7 +219,8 @@ def main():
                          "--prefetch_frames --cache_region_indices "
                          "--activation_arena --pinned_io --lean_reads "
                          "--read_ahead --fast_load --decode_once "
-                         "--lean_foundations --gpu_prep --async_baton), expandable "
+                         "--lean_foundations --gpu_prep --async_baton, "
+                         "--exr_workers), expandable "
                          "allocator segments on Linux, and auto window sizes "
                          "from the optimized path's memory table. Same output "
                          "for the same window; auto mode picks larger windows "
@@ -232,6 +240,9 @@ def main():
         args.pinned_io = args.lean_reads = args.read_ahead = True
         args.fast_load = args.decode_once = args.lean_foundations = True
         args.gpu_prep = args.async_baton = True
+    if args.exr_workers is None:
+        args.exr_workers = (min(8, max(2, (os.cpu_count() or 8) // 4))
+                            if args.optimized else 1)
 
     device = select_device()
     if args.optimized and torch.device(device).type == "cuda":
@@ -296,6 +307,7 @@ def main():
         decode_once=args.decode_once,
         read_workers=args.read_workers,
         gpu_prep=args.gpu_prep,
+        exr_workers=args.exr_workers,
     )
     model = load_model(paths, device=device, skip_init=args.fast_load)
     apply_weight_policy(model, freeze=args.frozen_weights,

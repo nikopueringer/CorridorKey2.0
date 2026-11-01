@@ -175,6 +175,9 @@ class InferenceConfig:
     # Threads the prepass prepares frames on.
     read_workers: int = 4
     gpu_prep: bool = False
+    # Opt-in: EXR frames compressed and written by this many threads per
+    # output (video_io.ExrSequenceWriter); the same files.
+    exr_workers: int = 1
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -1512,7 +1515,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 writers[name] = ExrSequenceWriter(
                     os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
-                    dtype=cfg.exr_dtype, frame_name=suffix[name])
+                    dtype=cfg.exr_dtype, frame_name=suffix[name],
+                    workers=cfg.exr_workers)
             else:
                 ext = ".mov" if name == "cutout" else ".mp4"
                 channels = 4 if name == "cutout" else 3
