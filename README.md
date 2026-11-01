@@ -424,6 +424,78 @@ These come from measurements on synthetic test clips; other software using the
 GPU reduces what is available. If you hit a CUDA out-of-memory error, pass
 `--low_vram` with a smaller `--hann_chunk` yourself.
 
+### Optimized mode
+
+The launcher's default memory profile, and `--optimized` on the command line,
+run the same model in less memory and less time. With the same window size the
+output is identical; in auto mode the saved memory goes into longer windows:
+
+| GPU memory (free) | 720p | 1080p | 1440p | 3K | 4K |
+|---|---|---|---|---|---|
+| 6 GB laptop (4.95 GB) | 48/24 | 40/20 | 28/14 | 16/8 | 10/5 |
+| 8 GB (6.95 GB) | 64/32 | 56/28 | 40/20 | 24/12 | 16/8 |
+| 12 GB (10.95 GB) | 80/40 normal | 80/40 | 64/32 | 40/20 | 28/14 |
+| 16 GB (14.95 GB) | 80/40 normal | 80/40 normal | 80/40 | 64/32 | 40/20 |
+| 24 GB (22.95 GB) | 80/40 normal | 80/40 normal | 80/40 normal | 80/40 | 64/32 |
+
+Windows picks, low-VRAM mode unless marked normal; the shipped settings on a
+6 GB card are 8/4 at 720p and 1080p, 4/2 at 1440p and 2/1 at 3K and 4K.
+Linux gets a step or two more from 1440p up (a 6 GB card runs 32/16 at 1440p,
+24/12 at 3K and 16/8 at 4K): PyTorch's allocator has expandable segments there
+and not on Windows.
+
+Choose "Auto, original" in the launcher, or leave out `--optimized`, for the
+original settings. The measurements, and how the output was checked, are in
+https://github.com/nikopueringer/CorridorKey2.0/pull/18.
+
+`--optimized` also keeps the GPU busy while the host reads and writes
+frames, and starts faster. Each of these leaves every output file
+byte-identical and can be used on its own:
+
+- `--pinned_io`: frames are quantized to 16 bits on the GPU (the same values
+  as before for every possible input) and copied through pinned memory one
+  frame behind, so the GPU starts the next frame instead of waiting.
+- `--lean_reads`: in low-VRAM mode, stages that only feed the model skip
+  preparing each frame's display view (for linear EXR input that is an sRGB
+  conversion of every pixel).
+- `--read_ahead`: stage 1's first window is read while the prepass runs;
+  later windows and stage 2's frames are read on worker threads.
+- `--fast_load`: the model is built without first filling its weights with
+  random values, since every one is then loaded from the checkpoints.
+- `--decode_once`: each frame is decoded and converted once; the later
+  stages read the model's input back from a temporary file (about 13 MB per
+  1080p frame and 53 MB per 4K frame in `--temp_dir`, twice that in normal
+  mode; skipped when the temp folder is short of space). Most useful at 4K
+  and with EXR input.
+- `--gpu_prep`: with `--decode_once` and a frame folder, each frame's
+  color conversions run on the GPU. For 8-bit images and half-float EXRs
+  the GPU gives the CPU's bits for every possible value; EXRs stored as
+  32-bit float, where a few values round differently, stay on the CPU.
+- `--async_baton`: in low-VRAM mode, stage 1's windows run back to back on
+  the GPU; each window's output is copied back and blended into the
+  finished frames while the GPU runs the next one.
+- `--exr_workers N`: with `--output_format exr`, N frames per output are
+  compressed and written at once (default 1; `--optimized` uses a quarter of
+  the CPU cores, 2 to 8). Each file is still written whole by one thread from
+  the same pixels, so the files are the same. ZIP-compressing a 4K frame
+  takes a CPU core a few seconds, which otherwise sets the pace at 4K.
+
+These were checked on Volta, Turing, Ampere, Ada, Hopper and Blackwell GPUs:
+at the same window, `--optimized` writes the original's files on each. On
+some cards the original's own output varies slightly from run to run
+(cuDNN's default algorithms on an RTX 4090, the carry hint on an RTX 5080);
+with deterministic cuDNN on the 4090 and the carry hint off on the 5080,
+both repeat and agree.
+
+`--fast` is `--optimized` with more threads per video encoder (or pass
+`--ffmpeg_threads N` yourself). The keyed frames are identical, but x264's
+output depends on its thread count, so the encoded files differ slightly
+from the default two-thread encode. On fast GPUs at HD the encoder often
+sets the pace and `--fast` is 5-10% faster; at 4K on a CPU with 16 cores or
+fewer the extra encoder threads compete with frame preparation and can make
+it slower, so measure on your machine. On a 6 GB RTX 3060 Laptop, where the
+GPU sets the pace, it measured 1-3% faster at 1080p and 1440p.
+
 The normal path streams video and does not intentionally hold an entire long
 clip in RAM. To force low-VRAM mode yourself, add:
 
