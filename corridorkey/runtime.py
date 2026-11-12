@@ -317,6 +317,8 @@ def max_split_configured() -> bool:
 
 def expandable_segments_active() -> bool:
     """Whether the CUDA caching allocator is handing out expandable segments."""
+    if not torch.cuda.is_available():
+        return False
     return any(seg.get("is_expandable") for seg in torch.cuda.memory_snapshot())
 
 
@@ -343,7 +345,7 @@ def reserve_activation_arena(nbytes: int) -> int:
     Skipped when the allocator has expandable segments (they already avoid
     this) or `max_split_size_mb` (blocks above it are never split, so the
     arena would sit unused). Returns the bytes reserved."""
-    if max_split_configured() or expandable_segments_active():
+    if not torch.cuda.is_available() or max_split_configured() or expandable_segments_active():
         return 0
     torch.cuda.empty_cache()
     free_bytes, _ = torch.cuda.mem_get_info()
@@ -534,7 +536,8 @@ def apply_weight_policy(model, *, freeze: bool = False,
                 module.weight.data = module.weight.data.to(torch.bfloat16)
                 if module.bias is not None:
                     module.bias.data = module.bias.data.to(torch.bfloat16)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 _UNUSED_MOGE_PARTS = ("neck", "points_head", "normal_head", "mask_head", "scale_head")
@@ -548,7 +551,8 @@ def drop_unused_foundation_parts(model) -> int:
         if isinstance(part, torch.nn.Module):
             freed += sum(p.numel() for p in part.parameters())
             setattr(moge, name, None)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return freed
 
 
@@ -956,7 +960,8 @@ def precompute_prepasses_to_memmap(model, source, meta, *, rvm_path: Path | None
         if out is not None:
             out.flush()
     del rvm_out, moge_out, cradio_out, model_views, foundation_views
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return foundation_paths
 
 

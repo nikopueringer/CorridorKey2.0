@@ -247,6 +247,10 @@ def main():
     device = select_device()
     if args.optimized and torch.device(device).type == "cuda":
         configure_allocator()
+    if args.optimized and torch.device(device).type != "cuda":
+        # These features rely on CUDA allocator internals or CUDA events
+        # and crash or are no-ops on MPS (unified memory, no PCIe).
+        args.activation_arena = args.pinned_io = args.async_baton = False
     require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
