@@ -40,7 +40,22 @@ from .blocks import (
     FusionLinSwiglu,
     init_orthogonal_rgb_passthrough_,
 )
+from .pinned import HostBuffer
 from .rope import RoPE2D, RoPE3D
+
+
+def _skip_add_in_place(module, target: torch.Tensor, *others: torch.Tensor) -> bool:
+    """Opt-in (`inference_inplace_skips`, inference only): whether a skip
+    connection `a + scale * target` may be computed in place on `target`, a
+    tensor the caller drops right after. Exact when `target` already has the
+    dtype the out-of-place result would have: the same multiply and the same
+    (commutative) add, without two more full-size tensors."""
+    if not getattr(module, "inference_inplace_skips", False) or module.training:
+        return False
+    dtype = target.dtype
+    for other in others:
+        dtype = torch.promote_types(dtype, other.dtype)
+    return dtype == target.dtype
 
 
 @torch.no_grad()
@@ -612,6 +627,46 @@ class Stage1(nn.Module):
             x = self._ckpt_block(blk, x, t_stride, adaln_cond=cond)
         return x.permute(0, 1, 4, 2, 3).contiguous()
 
+    def _swin3d_run_lean(
+        self,
+        blocks,
+        holder: list,
+        t_stride: float,
+        skip_holder: list | None = None,
+        late_skip_scale: torch.Tensor | None = None,
+        late_skip_index: int | None = None,
+    ) -> torch.Tensor:
+        """`_swin3d_run` for the mid/decoder stacks with tensor ownership
+        handed over (`inference_lean`): the (B, T, C, H, W) input arrives in a
+        one-element list so this method holds the only reference and it is
+        freed once permuted, and the late skip is permuted only right before
+        the block that adds it. Same operations in the same order."""
+        src = holder.pop()
+        x = src.permute(0, 1, 3, 4, 2).contiguous()
+        if x.data_ptr() == src.data_ptr():
+            # Already NTHWC: own a copy, since blocks may add into x in place.
+            x = x.clone()
+        del src
+        scale = None
+        if skip_holder is not None:
+            if late_skip_scale is None:
+                raise ValueError("late_skip_scale is required with a late skip")
+            if late_skip_index is None:
+                late_skip_index = max(len(blocks) - 2, 0)
+            scale = late_skip_scale.to(device=x.device, dtype=x.dtype).view(
+                1, 1, 1, 1, -1)
+        for i, blk in enumerate(blocks):
+            if skip_holder is not None and i == late_skip_index:
+                skip = skip_holder.pop().to(x.device, non_blocking=True).permute(
+                    0, 1, 3, 4, 2).contiguous()
+                if _skip_add_in_place(self, x, skip, scale):
+                    x.add_(skip * scale)
+                else:
+                    x = x + skip * scale
+                del skip
+            x = self._ckpt_block(blk, x, t_stride)
+        return x.permute(0, 1, 4, 2, 3).contiguous()
+
     def _full_run(self, blocks, x_5d: torch.Tensor, t_stride: float) -> torch.Tensor:
         """Run full-spatiotemporal blocks on (B, T, C, H, W)."""
         x = x_5d.permute(0, 1, 3, 4, 2).contiguous()
@@ -729,9 +784,9 @@ class Stage1(nn.Module):
 
     def forward(
         self,
-        rgb: torch.Tensor,         # (B, T, 3, H, W) signed asinh encoded scene-linear RGB
-        hint: torch.Tensor,        # (B, T, 1, H, W) in [0, 1]
-        moge_feat: torch.Tensor,   # (B, T, moge_dim, H/64, W/64)
+        rgb: 'torch.Tensor | None' = None,  # (B, T, 3, H, W) signed asinh encoded scene-linear RGB
+        hint: 'torch.Tensor | None' = None,  # (B, T, 1, H, W) in [0, 1]
+        moge_feat: 'torch.Tensor | None' = None,  # (B, T, moge_dim, H/64, W/64)
         cradio_feat: 'torch.Tensor | None' = None,  # (B, T, cradio_dim, H/64, W/64)
         rvm_feat: 'torch.Tensor | None' = None,  # (B, T, rvm_dim, H/64, W/64) if enabled
         t_stride: float = 1.0,
@@ -740,11 +795,22 @@ class Stage1(nn.Module):
         mae_vfm_mask_64: 'torch.Tensor | None' = None,  # (B,T,1,H/64,W/64)
         hint_quality: 'torch.Tensor | None' = None,  # (B,T), -1=decide subject, 0=no frame hint, 1=perfect
         recurrent_states: 'tuple[torch.Tensor | None, ...] | None' = None,
+        inputs: 'dict | None' = None,
     ) -> dict:
         """Returns dict with:
             baton: (B, T, d_16, H/16, W/16)  — feeds stage 2
             aux:   (B, T, 4, H/2, W/2)       — stage-1 supervised output
+
+        `inputs` (inference): rgb, hint, moge_feat, cradio_feat and rvm_feat
+        handed over in a dict that this method empties, so when the caller
+        keeps no other reference the full-resolution input is freed after the
+        stem and the /64 features after the fusion. Same operations.
         """
+        if inputs is not None:
+            rgb, hint = inputs.pop("rgb"), inputs.pop("hint")
+            moge_feat = inputs.pop("moge_feat")
+            cradio_feat = inputs.pop("cradio_feat", None)
+            rvm_feat = inputs.pop("rvm_feat", None)
         B, T, _, H, W = rgb.shape
         assert H % 64 == 0 and W % 64 == 0, (
             f"Stage1: H,W must be multiples of 64 (shape_quantum); got {(H, W)}")
@@ -752,12 +818,31 @@ class Stage1(nn.Module):
         # Merge B·T for conv ops that don't care about T
         BT = B * T
         hint_quality = self._resolve_hint_quality(hint, hint_quality)
-        x_in = torch.cat([rgb, hint], dim=2).reshape(BT, 4, H, W)
+        stem_chunk = int(getattr(self, "inference_stem_frame_chunk", 0) or 0)
+        if stem_chunk > 0 and not self.training:
+            # Opt-in: concat and patchify a few frames at a time (the stem is
+            # per frame), so the full-resolution concat and cuDNN's layout
+            # buffers exist for one chunk instead of the whole window.
+            # Bit-identical: cuDNN keeps its algorithm for the smaller batch.
+            f_16 = None
+            for t0 in range(0, T, stem_chunk):
+                t1 = min(t0 + stem_chunk, T)
+                x_t = torch.cat([rgb[:, t0:t1], hint[:, t0:t1]], dim=2)
+                y = self.stem(x_t.reshape(B * (t1 - t0), 4, H, W))
+                del x_t
+                if f_16 is None:
+                    f_16 = y.new_empty((B, T) + tuple(y.shape[1:]))
+                f_16[:, t0:t1] = y.view(B, t1 - t0, *y.shape[1:])
+                del y
+            del rgb, hint
+        else:
+            x_in = torch.cat([rgb, hint], dim=2).reshape(BT, 4, H, W)
+            del rgb, hint
 
-        # /1 → /16 patchify
-        f_16 = self.stem(x_in)                                   # (BT, d_16, H/16, W/16)
-        del x_in
-        f_16 = f_16.reshape(B, T, self.d_16, H // 16, W // 16)
+            # /1 → /16 patchify
+            f_16 = self.stem(x_in)                                   # (BT, d_16, H/16, W/16)
+            del x_in
+            f_16 = f_16.reshape(B, T, self.d_16, H // 16, W // 16)
         if mae_mask_16 is not None:
             f_16 = self._apply_mae_token(f_16, mae_mask_16,
                                          self.mae_token_16, "stage1 /16")
@@ -767,6 +852,16 @@ class Stage1(nn.Module):
         # U-skip before the downsample eats the spatial detail.
         f_16_enc = self._swin3d_run(
             self.enc_16, f_16, t_stride, hint_quality=hint_quality)
+        lean = bool(getattr(self, "inference_lean", False)) and not self.training
+        if lean:
+            del f_16  # f_16_patch is the only handle the late skip needs
+            if getattr(self, "inference_offload_late_skip", False):
+                # Parked in host memory until the decoder's late skip needs it.
+                if getattr(self, "_late_skip_host", None) is None:
+                    self._late_skip_host = HostBuffer()
+                parked = self._late_skip_host.view(f_16_patch.shape, f_16_patch.dtype)
+                parked.copy_(f_16_patch, non_blocking=True)
+                f_16_patch = parked
 
         # /16 → /64 downsample (center-cell area init; produces d_down_aux channels)
         f_16_flat = f_16_enc.reshape(BT, self.d_16, H // 16, W // 16)
@@ -820,7 +915,7 @@ class Stage1(nn.Module):
         # Full concat at /64 (vfm + downsampled aux) → either direct /64 body
         # input or fusion (linear+SwiGLU).
         combined = torch.cat([vfm_cat, f_64_down], dim=2)      # (B, T, vfm+aux, h, w)
-        del vfm_cat, f_64_down, vfm_parts
+        del vfm_cat, f_64_down, vfm_parts, moge_feat, cradio_feat, rvm_feat
         tokens = combined.permute(0, 1, 3, 4, 2).contiguous()  # (B, T, h, w, fuse_in_dim)
         del combined
         f_64 = tokens if self.fuse is None else self.fuse(tokens)  # (B, T, h, w, d_64)
@@ -853,9 +948,16 @@ class Stage1(nn.Module):
             B, T, self.d_16, H // 16, W // 16)
         del f_64_mid_flat
         mid_scale = self.mid_skip_scale.view(1, 1, self.d_16, 1, 1)
-        f_16_mid = f_16_mid_up + mid_scale * f_16_enc
+        if _skip_add_in_place(self, f_16_enc, mid_scale, f_16_mid_up):
+            f_16_mid = f_16_enc.mul_(mid_scale).add_(f_16_mid_up)
+        else:
+            f_16_mid = f_16_mid_up + mid_scale * f_16_enc
         del f_16_mid_up, f_16_enc
-        if len(self.mid_16) > 0:
+        if len(self.mid_16) > 0 and lean:
+            holder = [f_16_mid]
+            del f_16_mid
+            f_16_mid = self._swin3d_run_lean(self.mid_16, holder, t_stride)
+        elif len(self.mid_16) > 0:
             f_16_mid = self._swin3d_run(self.mid_16, f_16_mid, t_stride)
         f_16_mid_flat = f_16_mid.reshape(BT, self.d_16, H // 16, W // 16)
         f_64_delta = self.mid_down(f_16_mid_flat).reshape(
@@ -892,17 +994,30 @@ class Stage1(nn.Module):
         # Learned-weight U-Net skip: add encoder /16 features scaled by a
         # per-channel parameter. Broadcasts (d_16,) over (B, T, C, H, W).
         scale = self.uskip_scale.view(1, 1, self.d_16, 1, 1)
-        f_16_dec = f_16_up + scale * f_16_mid
+        if _skip_add_in_place(self, f_16_mid, scale, f_16_up):
+            f_16_dec = f_16_mid.mul_(scale).add_(f_16_up)
+        else:
+            f_16_dec = f_16_up + scale * f_16_mid
         del f_16_up, f_16_mid
 
         # /16 decoder side (Swin-3D)
-        baton = self._swin3d_run(
-            self.dec_16, f_16_dec, t_stride,
-            late_skip_5d=f_16_patch,
-            late_skip_scale=self.patch_late_skip_scale,
-            late_skip_index=max(len(self.dec_16) - 2, 0),
-        )   # (B, T, d_16, H/16, W/16)
-        del f_16_dec, f_16_patch
+        if lean:
+            holder, patch_holder = [f_16_dec], [f_16_patch]
+            del f_16_dec, f_16_patch
+            baton = self._swin3d_run_lean(
+                self.dec_16, holder, t_stride,
+                skip_holder=patch_holder,
+                late_skip_scale=self.patch_late_skip_scale,
+                late_skip_index=max(len(self.dec_16) - 2, 0),
+            )
+        else:
+            baton = self._swin3d_run(
+                self.dec_16, f_16_dec, t_stride,
+                late_skip_5d=f_16_patch,
+                late_skip_scale=self.patch_late_skip_scale,
+                late_skip_index=max(len(self.dec_16) - 2, 0),
+            )   # (B, T, d_16, H/16, W/16)
+            del f_16_dec, f_16_patch
 
         # Aux head: /16 baton → /2 pred (α, FG). With production dims and
         # non-overlap patching, FG is the exact area-downsampled inverse of
