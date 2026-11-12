@@ -234,6 +234,7 @@ def main():
     if args.read_workers is None:
         args.read_workers = (min(12, max(4, (os.cpu_count() or 8) // 2))
                              if args.optimized or args.fast else 4)
+    args.auto_vram_optimized = args.optimized
     if args.optimized:
         args.bf16_weights = args.lean_activations = args.prefetch_frames = True
         args.cache_region_indices = args.activation_arena = True
@@ -251,6 +252,11 @@ def main():
         # These features rely on CUDA allocator internals or CUDA events
         # and crash or are no-ops on MPS (unified memory, no PCIe).
         args.activation_arena = args.pinned_io = args.async_baton = False
+        # The optimized VRAM table was measured on a specific CUDA GPU.
+        # On MPS, lean_activations delivers less memory saving than on CUDA,
+        # so the optimistic table selects chunks that OOM. Use the original
+        # table so the existing _MPS_ESTIMATE_SCALE keeps window selection safe.
+        args.auto_vram_optimized = False
     require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
@@ -273,7 +279,7 @@ def main():
         hann_chunk=hann_chunk,
         hann_stride=hann_stride,
         auto_vram=auto_vram,
-        auto_vram_optimized=args.optimized,
+        auto_vram_optimized=args.auto_vram_optimized,
         carry_hint=not args.no_carry_hint,
         hint_quality=args.hint_quality,
         carry_hint_quality=args.carry_hint_quality,
