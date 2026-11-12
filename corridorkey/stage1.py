@@ -786,9 +786,9 @@ class Stage1(nn.Module):
         input to bf16, so concatenating straight into bf16 gives it the same
         input without the fp32 concat."""
         B, T, _, H, W = rgb.shape
-        if (rgb.is_cuda and rgb.dtype == hint.dtype == torch.float32
-                and torch.is_autocast_enabled("cuda")
-                and torch.get_autocast_dtype("cuda") == torch.bfloat16):
+        if (rgb.device.type in ("cuda", "mps") and rgb.dtype == hint.dtype == torch.float32
+                and torch.is_autocast_enabled(rgb.device.type)
+                and torch.get_autocast_dtype(rgb.device.type) == torch.bfloat16):
             x = rgb.new_empty((B, T, 4, H, W), dtype=torch.bfloat16)
             x[:, :, :3] = rgb
             x[:, :, 3:] = hint
@@ -809,7 +809,7 @@ class Stage1(nn.Module):
         if chunk >= T:
             return T
         key = (B, T, H, W, rgb.dtype, hint.dtype, rgb.device, chunk,
-               torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"),
+               torch.is_autocast_enabled(rgb.device.type), torch.get_autocast_dtype(rgb.device.type),
                torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
         found = _STEM_CHUNKS.get(key)
         if found is None:

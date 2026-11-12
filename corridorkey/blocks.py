@@ -416,8 +416,8 @@ def _bf16_branch_input(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     either way (a bf16 x bf16 product is exact in fp32).
     """
     if (getattr(module, 'inference_bf16_branch_input', False) and not module.training
-            and torch.is_autocast_enabled("cuda")):
-        return x.to(torch.get_autocast_dtype("cuda"))
+            and torch.is_autocast_enabled(x.device.type)):
+        return x.to(torch.get_autocast_dtype(x.device.type))
     return x
 
 
@@ -1834,7 +1834,7 @@ class SwinAttention3D(nn.Module):
             # whole-frame GEMM on this input; otherwise each frame is
             # projected whole and the band cut out.
             key = (B, z - a, H, W, C, min(frame_chunk, T), x.dtype, x.device,
-                   torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
+                   torch.is_autocast_enabled(x.device.type), torch.get_autocast_dtype(x.device.type))
             if key not in _BAND_GEMM_EXACT:
                 t1 = min(frame_chunk, T)
                 whole = self.qkv.qkv(x[:, :t1])[:, :, a:z].contiguous()

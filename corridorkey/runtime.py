@@ -897,7 +897,7 @@ def precompute_prepasses_to_memmap(model, source, meta, *, rvm_path: Path | None
         Tc = len(chunk)
         rgb_rvm = torch.cat([c[0] for c in chunk]).reshape(
             1, Tc, 3, H // 4, W // 4).clamp(0.0, 1.0)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(device.type, dtype=torch.bfloat16):
             feats, rvm_state = model.foundations.rvm(rgb_rvm, state=rvm_state)
         feats_cpu = (feats.float().cpu() - mean) / std
         rvm_out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
@@ -906,7 +906,7 @@ def precompute_prepasses_to_memmap(model, source, meta, *, rvm_path: Path | None
         Tc = len(chunk)
         rgb_radio = torch.cat([c[1] for c in chunk], dim=1)
         rgb_moge = torch.cat([c[2] for c in chunk], dim=1)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(device.type, dtype=torch.bfloat16):
             ff = model.foundations(
                 rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                 rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
