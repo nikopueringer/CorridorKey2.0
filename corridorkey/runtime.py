@@ -189,9 +189,18 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
     return 1, 1, True, estimate
 
 
+_MPS_ESTIMATE_SCALE = 1.5
+
+
 def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cuda") -> None:
     budget_gb = memory_budget_gb(device)
-    chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
+    # CUDA reference peaks understate MPS memory usage (larger attention
+    # intermediates, unified-memory pressure from other allocations) and
+    # recommended_max_memory() returns virtual address space rather than the
+    # actual MPS watermark ceiling. Deflate the effective budget so the window
+    # selector is conservative enough to avoid MPS OOM.
+    effective_budget_gb = budget_gb / _MPS_ESTIMATE_SCALE if torch.device(device).type == "mps" else budget_gb
+    chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, effective_budget_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
     if torch.device(device).type == "mps" and low_vram:
         # CUDA-sized batches retain much larger attention intermediates on MPS.
