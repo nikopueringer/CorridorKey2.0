@@ -181,6 +181,24 @@ def invert_linear_adjust(linear: np.ndarray, meta: dict) -> np.ndarray:
     return (linear / gain - pivot) / contrast + pivot
 
 
+def _probe_frame_count(video_path: str, fps: float, cap: cv2.VideoCapture) -> int:
+    # CAP_PROP_FRAME_COUNT reads container metadata, which is unreliable for
+    # MP4s whose moov atom count disagrees with the actual encoded duration.
+    # ffprobe's duration × fps gives the correct decodable count; fall back to
+    # the OpenCV metadata count only when ffprobe is unavailable.
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, check=True,
+        )
+        duration_s = float(result.stdout.strip())
+        return max(1, round(duration_s * fps))
+    except Exception:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+
 def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      native_resolution: bool, start_mode: str, seed: int,
                      model_scale: float, linear_brightness: float,
@@ -192,7 +210,7 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     w_native = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    n_total = _probe_frame_count(video_path, native_fps, cap)
     cap.release()
 
     q = int(shape_quantum)
