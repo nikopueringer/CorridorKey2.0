@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import glob
 import math
 import os
@@ -296,9 +297,66 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
     return meta
 
 
+@functools.lru_cache(maxsize=8)
+def _uint8_view_luts(gain: float, contrast: float, pivot: float):
+    """bfloat16 bit patterns of each preprocessed view for all 256 code values.
+
+    Without a resize every view is a pure per-pixel function of the 8-bit code
+    value, so the float sRGB decode and asinh encode only need to run 256 times
+    instead of once per pixel. The tables are built by the same functions as
+    the float path, so the resulting tensors are identical.
+    """
+    meta = {"linear_brightness": gain, "linear_contrast": contrast,
+            "linear_contrast_pivot": pivot}
+    # Repeat each code so it is evaluated by the same vectorized kernels as a
+    # full frame rather than by a scalar tail loop.
+    rep = 64
+    frame = np.repeat(np.arange(256, dtype=np.uint8), rep).astype(np.float32) / 255.0
+    linear_model = apply_linear_adjust(cu.srgb_to_linear(frame), meta)
+
+    def bits(x: np.ndarray) -> np.ndarray:
+        t = torch.from_numpy(np.ascontiguousarray(x[::rep]))
+        return t.to(dtype=torch.bfloat16).view(torch.int16).numpy()
+
+    review = bits(frame)
+    foundation = (bits(cu.linear_to_vfm_sdr(linear_model))
+                  if has_linear_adjust(meta) else review)
+    return bits(cu.linear_to_asinh(linear_model)), foundation, review
+
+
+def _lut_to_bf16(chw_u8: np.ndarray, lut_bits: np.ndarray) -> torch.Tensor:
+    out = cv2.LUT(chw_u8.reshape(-1, chw_u8.shape[-1]), lut_bits)
+    return torch.from_numpy(out.reshape(chw_u8.shape)).view(torch.bfloat16)
+
+
+def _preprocess_uint8_bgr_views(frame_bgr: np.ndarray, meta: dict, *,
+                                need_model: bool):
+    """Table-lookup equivalent of the float path for unscaled 8-bit frames."""
+    h_out, w_out = meta["shape_hw"]
+    # Reflect padding copies pixels, so it commutes with the per-pixel lookup.
+    padded, _ = center_pad_to_shape(frame_bgr, h_out, w_out)
+    chw = np.ascontiguousarray(padded.transpose(2, 0, 1)[::-1])
+    model_lut, foundation_lut, review_lut = _uint8_view_luts(
+        float(meta.get("linear_brightness", 1.0)),
+        float(meta.get("linear_contrast", 1.0)),
+        float(meta.get("linear_contrast_pivot", 0.18)))
+    review = _lut_to_bf16(chw, review_lut)
+    foundation = (review if foundation_lut is review_lut
+                  else _lut_to_bf16(chw, foundation_lut))
+    model = _lut_to_bf16(chw, model_lut) if need_model else None
+    return model, foundation, review
+
+
+def _is_unscaled_uint8_bgr(frame, meta: dict) -> bool:
+    return (frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3
+            and frame.shape[:2] == tuple(meta["model_native_hw"]))
+
+
 def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    if _is_unscaled_uint8_bgr(frame_bgr, meta):
+        return _preprocess_uint8_bgr_views(frame_bgr, meta, need_model=need_model)
     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     frame = resize_hwc_lanczos(frame, (h_model, w_model))
     frame, _ = center_pad_to_shape(frame, h_out, w_out)
@@ -323,6 +381,15 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
 def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    if (not meta.get("exr_linear", False)
+            and not str(path).lower().endswith(".exr")):
+        # sRGB PNG/JPEG frames take the same table-lookup path as video.
+        frame_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise FileNotFoundError(path)
+        if _is_unscaled_uint8_bgr(frame_bgr, meta):
+            return _preprocess_uint8_bgr_views(
+                frame_bgr, meta, need_model=need_model)
     display, linear = _read_frame_dir_views(
         path, exr_linear=bool(meta.get("exr_linear", False)))
     display = resize_hwc_lanczos(display, (h_model, w_model))
