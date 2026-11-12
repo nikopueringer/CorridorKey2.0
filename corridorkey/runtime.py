@@ -1588,7 +1588,19 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         if cfg.decode_once and cfg.prefetch_frames:
             need = T_all * 3 * H * W * 2 * (1 if cfg.low_vram else 2)
             free = shutil.disk_usage(cfg.temp_dir).free
-            if need <= free // 2:
+            # On MPS, memmaps live in unified memory and compete with GPU
+            # allocations for the same physical pool. Only use decode_once
+            # if the memmap fits within the MPS headroom left after inference.
+            if device.type == "mps":
+                inference_gb = estimate_peak_vram_gb(
+                    H * W / 1e6, min(int(cfg.hann_chunk), T_all),
+                    cfg.low_vram, _VRAM_PEAK_GB_OPTIMIZED if cfg.auto_vram_optimized else _VRAM_PEAK_GB,
+                ) * _MPS_ESTIMATE_SCALE
+                mps_headroom = memory_budget_gb(device)
+                mps_ok = (need / 2**30) < max(0.0, mps_headroom - inference_gb)
+            else:
+                mps_ok = True
+            if need <= free // 2 and mps_ok:
                 model_view_path = cfg.temp_dir / f"{clip_name}_model.bf16"
                 if not cfg.low_vram:
                     foundation_view_path = cfg.temp_dir / f"{clip_name}_foundation_view.bf16"
