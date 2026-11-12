@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "corridorkey"
+version = "2.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "numpy>=1.26,<2; sys_platform != 'darwin'",
+    "opencv-python>=4.11; sys_platform != 'darwin'",
+    # The older Apple Silicon wheel corrupts the final row of tested YUV444 video.
+    "numpy>=2,<3; sys_platform == 'darwin'",
+    "opencv-python==4.13.0.92; sys_platform == 'darwin'",
+    "transformers>=4.57,<5",
+    "timm>=1.0",
+    "safetensors>=0.6",
+    "huggingface-hub>=0.36",
+    "einops>=0.8",
+    "scipy>=1.16",
+    "pillow>=11",
+    "tqdm>=4.67",
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project.scripts]
+corridorkey = "infer:main"
+corridorkey-interactive = "run_interactive:main"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Build optional native attention with Xcode; no model conversion is required."""
 from pathlib import Path
 import platform

@@ -35,12 +35,9 @@ Use native arm64 Python 3.12, a macOS version with Metal bfloat16 support
 (macOS 14 or later), and `ffmpeg` on your `PATH`. From the repository root:
 
 ```sh
-python3.12 -m venv venv
-source venv/bin/activate
-pip install torch==2.9.1 torchvision==0.24.1
-pip install -r requirements.txt
-python scripts/download_weights.py
-python infer.py --input /path/to/clip.mp4 --output_dir /path/to/output
+uv sync
+uv run scripts/download_weights.py
+uv run corridorkey --input /path/to/clip.mp4 --output_dir /path/to/output
 ```
 
 The existing CLI automatically selects Metal when CUDA is unavailable.
@@ -54,7 +51,7 @@ memory and improves throughput. With Apple's command-line developer tools
 installed, build it in the same Python environment before running inference:
 
 ```sh
-python scripts/build_mps_attention.py
+uv run scripts/build_mps_attention.py
 ```
 
 Rebuild after changing PyTorch or moving the environment. A missing or
@@ -78,24 +75,15 @@ CUDA/Metal pixels are not guaranteed.
 ### NVIDIA CUDA
 
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
-for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
-environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
-This package was tested with:
+for footage up to 1440p, or 6 GB for 4K, and `ffmpeg` on your PATH. On smaller cards,
+see [Long Clips And Low VRAM](#long-clips-and-low-vram).
+
+From the repository root, install dependencies and download the model weights
+(about 5 GB). `uv` selects the CUDA 12.8 PyTorch wheel automatically on Linux and Windows:
 
 ```
-torch==2.9.1
-torchvision==0.24.1
-```
-
-From the repository root, create an environment, install PyTorch and the
-remaining dependencies, and download the model weights (about 5 GB):
-
-```
-python -m venv venv
-source venv/bin/activate
-pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-python scripts/download_weights.py
+uv sync
+uv run scripts/download_weights.py
 ```
 
 The download script fetches:
@@ -127,7 +115,7 @@ full hint video).
 You can also start the same guided session directly:
 
 ```
-python run_interactive.py /path/to/clip.mp4
+uv run corridorkey-interactive /path/to/clip.mp4
 ```
 
 ## Quick Start
@@ -135,7 +123,7 @@ python run_interactive.py /path/to/clip.mp4
 From the repository root:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/input.mp4 \
   --output_dir /path/to/output
 ```
@@ -158,7 +146,7 @@ the model to decide for itself.
 ### No Hint
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_no_hint
 ```
@@ -176,7 +164,7 @@ Tradeoffs:
 ### First-Frame Hint
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1_hint \
   --hint_first_frame frame_0001_matte.png \
@@ -202,7 +190,7 @@ Tradeoffs:
 ### Full Hint Video
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint \
   --hint_video hint_matte_video.mp4 \
@@ -226,7 +214,7 @@ Tradeoffs:
 ### Full Hint Video Without Carry
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint_no_carry \
   --hint_video hint_matte_video.mp4 \
@@ -259,7 +247,7 @@ Practical values:
 For carried Hann hints, use `--carry_hint_quality`. The default is `0.95`.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1_hint \
   --hint_first_frame frame_0001_matte.png \
@@ -311,7 +299,7 @@ What the settings mean:
 Example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_window_8 \
   --hann_chunk 8 \
@@ -334,7 +322,7 @@ Available output choices:
 Select outputs explicitly:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_review \
   --outputs alpha fg checker cutout
@@ -349,7 +337,7 @@ more ffmpeg encoding. For fastest normal use, keep the default `alpha fg`. Add
 Use `--despill_strength` (value from `0.0` for no despill to `1.0` for full despill, defaults to `0.5`) to configure the despill amount applied to the `checker` and `cutout` outputs.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_despill \
   --outputs checker cutout \
@@ -415,7 +403,7 @@ at most ~0.05% on top of that; `float` adds none.
 Typical HDR round trip from linear EXR plates:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/linear_exr_frames \
   --frame_dir_linear \
   --frame_dir_fps 24 \
@@ -448,7 +436,7 @@ unclipped HDR.
 Override these as needed for your pipeline. For example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_encoded \
   --ffmpeg_codec libx264 \
@@ -487,7 +475,7 @@ The normal path streams video and does not intentionally hold an entire long
 clip in RAM. To force low-VRAM mode yourself, add:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input long_shot.mp4 \
   --output_dir out_low_vram \
   --low_vram \
@@ -525,7 +513,7 @@ Use the defaults unless you are actively tuning memory behavior.
 read in sorted filename order. Supported extensions are EXR, PNG, JPG, and JPEG.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/frames \
   --frame_dir_fps 24 \
   --output_dir out_frames
@@ -540,7 +528,7 @@ Frame directories are treated as display-coded by default. If the incoming image
 Example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/linear_exr_frames \
   --frame_dir_fps 24 \
   --frame_dir_linear \
@@ -552,7 +540,7 @@ python infer.py \
 For quick tests, process only part of a clip:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_test \
   --num_frames 100 \
@@ -636,13 +624,13 @@ mismatches raise errors instead of falling back to a different behavior.
 No hint, fastest standard outputs:
 
 ```
-python infer.py --input shot.mp4 --output_dir out_no_hint
+uv run corridorkey --input shot.mp4 --output_dir out_no_hint
 ```
 
 First-frame hint with default carry:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1 \
   --hint_first_frame matte_frame_0001.png \
@@ -652,7 +640,7 @@ python infer.py \
 Full hint video, trusting the provided hint on every pass:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint \
   --hint_video hint.mp4 \
@@ -663,7 +651,7 @@ python infer.py \
 Review render with checker and cutout:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_review \
   --hint_first_frame matte_frame_0001.png \
@@ -673,7 +661,7 @@ python infer.py \
 Lower-memory 8-frame windows:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_lowmem_window \
   --hint_first_frame matte_frame_0001.png \
