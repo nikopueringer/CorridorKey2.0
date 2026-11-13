@@ -59,6 +59,10 @@ inference or Resolve compatibility**. MPS-only tests may be skipped when the
 hosted runner has no usable Metal GPU. The workflow uploads the app archive
 only after those checks pass.
 
+The initial arm64 CI build passed its relocation/signature/UI checks and
+41 tests, including available Metal tests; 5 optional native-attention tests
+were skipped. Full-model video inference in the packaged app remains untested.
+
 ## Upstream credit and review
 
 Original commits and licenses are retained. See [PR review](../../docs/PR_REVIEW.md)

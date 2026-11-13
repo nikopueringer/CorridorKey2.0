@@ -55,6 +55,7 @@ OFX_PLUGIN_PATH="$HOME/.local/lib/OFX/Plugins${OFX_PLUGIN_PATH:+:$OFX_PLUGIN_PAT
 
 The environment must be present when Resolve starts. A normal Resolve launch
 will not pick up this user-local path unless configured separately.
+`./scripts/resolve_with_ofx.sh` sets this path and launches Resolve for you.
 
 1. Restart Resolve after installation.
 2. In the CorridorKey GUI, click **Start Resolve engine** and wait for
@@ -92,10 +93,13 @@ engine owned by that UI to release GPU memory.
   preview modes output opaque images.
 - Failures are reported to the host rather than silently returning an unkeyed
   source. No commands or file paths are accepted through the frame protocol.
-- Resolve Studio 21.2 on Linux was verified to discover/register the effect
-  and create a Fusion instance. Actual host render/alpha/colour validation
-  remains open: the headless test harness failed even for a plain
-  Background-to-EXR Saver graph, before evaluating this plugin.
+- Resolve Studio 21.2 on Linux was verified to discover/register the effect,
+  create a Fusion instance and export matte and keyed RGBA through its timeline
+  Deliver path. A synthetic 640×360 clip produced finite EXRs, grayscale matte
+  output and keyed alpha spanning 0–1; the keyed result was visually inspected.
+  This is a host smoke test, not a real-footage or colour-management validation
+  matrix. Direct rendering of detached Fusion Saver graphs did not work in the
+  headless harness; timeline rendering exercised the plugin successfully.
 
 ## Tests
 
