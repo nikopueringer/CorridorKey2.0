@@ -12,6 +12,11 @@ static int launcherStatus = 0;
 
 - (void)showLaunchError:(NSString *)message {
     launcherStatus = 1;
+    NSArray<NSString *> *args = [NSProcessInfo processInfo].arguments;
+    if ([args containsObject:@"--bundle-self-test"] || [args containsObject:@"--bundle-self-test-fail"]) {
+        fprintf(stderr, "%s\n", message.UTF8String);
+        exit(launcherStatus);
+    }
     NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:
         @"Library/Logs/CorridorKey2.0/launcher.log"];
     NSAlert *alert = [[NSAlert alloc] init];
@@ -80,7 +85,8 @@ static int launcherStatus = 0;
                                NSMakeRange(1, [NSProcessInfo processInfo].arguments.count - 1)]) {
         if (![argument hasPrefix:@"-psn_"]) [arguments addObject:argument];
     }
-    BOOL selfTest = [arguments containsObject:@"--bundle-self-test"];
+    BOOL selfTest = [arguments containsObject:@"--bundle-self-test"] ||
+                    [arguments containsObject:@"--bundle-self-test-fail"];
     self.task.arguments = arguments;
     self.task.currentDirectoryURL = [NSURL fileURLWithPath:source isDirectory:YES];
     self.task.environment = environment;
@@ -93,6 +99,9 @@ static int launcherStatus = 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [strongSelf.logFile synchronizeFile];
                 launcherStatus = finishedTask.terminationStatus;
+                // AppKit terminate: exits before main can return its status.
+                // CI must observe the actual Python result, including failure.
+                if (selfTest) exit(launcherStatus);
                 if (launcherStatus != 0 && !selfTest) {
                     [strongSelf showLaunchError:@"The Python runtime exited with an error. See the launcher log for details."];
                 } else {

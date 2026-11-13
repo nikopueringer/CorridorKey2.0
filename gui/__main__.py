@@ -9,6 +9,9 @@ on start. The UI needs PySide6 on top of requirements.txt:
 """
 import sys
 
+if sys.argv[1:] == ["--bundle-self-test-fail"]:
+    sys.exit(17)  # CI verifies the native launcher propagates child failures.
+
 if sys.argv[1:] == ["--bundle-self-test"]:
     from .bundle_selftest import main
     sys.exit(main())

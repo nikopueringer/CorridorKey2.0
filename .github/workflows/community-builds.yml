@@ -27,6 +27,12 @@ jobs:
           rm -rf dist/CorridorKey.app
           codesign --verify --deep --strict "$APP"
           QT_QPA_PLATFORM=offscreen "$APP/Contents/MacOS/CorridorKey" --bundle-self-test
+          if "$APP/Contents/MacOS/CorridorKey" --bundle-self-test-fail; then
+            echo "Launcher incorrectly hid a failing child process"
+            exit 1
+          else
+            test "$?" -eq 17
+          fi
           PY="$APP/Contents/Resources/Python/bin/python3"
           SRC="$APP/Contents/Resources/src"
           "$PY" "$SRC/infer.py" --help
