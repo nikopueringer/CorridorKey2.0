@@ -6,6 +6,7 @@ a clip dropped on the window picks up the same hints the wizard would find.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ class Clip:
     is_frames: bool
     hint_kind: str = HINT_NONE
     hint_path: Path | None = None
+    input_color_space: str = "legacy"
     status: str = QUEUED
     progress: float = 0.0
     detail: str = ""
@@ -124,11 +126,22 @@ def find_outputs(clip: Clip, output_dir: Path) -> dict[str, Path]:
     found = {}
     if not output_dir.is_dir():
         return found
+    try:
+        saved = json.loads((output_dir / f"{clip.name}_color.json").read_text()).get("outputs", {})
+        if not isinstance(saved, dict):
+            saved = {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        saved = {}
     stem = glob.escape(clip.name)
     for key, suffix in OUTPUT_SUFFIXES.items():
         candidates = [p for p in output_dir.glob(f"{stem}_{suffix}.*")
                       if p.suffix.lower() in (".mp4", ".mov")]
         candidates += [p for p in output_dir.glob(f"{stem}_{suffix}_exr") if p.is_dir()]
         if candidates:
-            found[key] = max(candidates, key=lambda p: p.stat().st_mtime)
+            entry = saved.get(key, {})
+            recorded = entry.get("path") if isinstance(entry, dict) else None
+            # Only choose from the discovered output names. A sidecar cannot
+            # redirect the viewer outside this clip's output directory.
+            completed = next((p for p in candidates if p.name == recorded), None)
+            found[key] = completed or max(candidates, key=lambda p: p.stat().st_mtime)
     return found

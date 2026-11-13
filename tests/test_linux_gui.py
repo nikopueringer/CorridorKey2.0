@@ -254,10 +254,14 @@ def test_frame_loader_cancels_old_generation_without_poisoning_new_request(
 
     class BlockingSource:
         def __init__(self, path, linear_float=True, cutout=False,
-                     sequence_fps=24.0, cutout_linear=False):
+                     sequence_fps=24.0, cutout_linear=False, profile_id="legacy",
+                     display_transform=True, input_range="auto"):
             self.linear_float = linear_float
             self.cutout = cutout
             self.cutout_linear = cutout_linear
+            self.profile_id = profile_id
+            self.display_transform = display_transform
+            self.input_range = input_range
             self._interrupted = threading.Event()
             self.files = None
             self.count, self.fps = 2, 25.0
@@ -298,9 +302,13 @@ def test_frame_loader_shutdown_interrupts_active_read_quickly(app, monkeypatch, 
 
     class BlockingSource:
         def __init__(self, path, linear_float=True, cutout=False,
-                     sequence_fps=24.0, cutout_linear=False):
+                     sequence_fps=24.0, cutout_linear=False, profile_id="legacy",
+                     display_transform=True, input_range="auto"):
             self.linear_float, self.cutout = linear_float, cutout
             self.cutout_linear = cutout_linear
+            self.profile_id = profile_id
+            self.display_transform = display_transform
+            self.input_range = input_range
             self._interrupted = threading.Event()
             self.files = None
             self.count, self.fps = 1, 25.0

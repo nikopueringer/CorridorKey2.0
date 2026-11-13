@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from . import color_utils as cu
+from .camera_video import CameraVideoReader, read_frame_dir_codes
 
 
 @dataclass
@@ -239,6 +240,7 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
             raise ValueError(f"unknown start mode {start_mode!r}")
 
     meta = {
+        "total_frames": n_total if n_total > 0 else None,
         "native_fps": native_fps,
         "native_hw": native_hw,
         "output_hw": output_hw,
@@ -393,6 +395,29 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     return model_t, foundation, review
 
 
+def preprocess_camera_code_views(rgb_codes: np.ndarray, meta: dict, *,
+                                 need_model: bool):
+    """Decode camera RGB codes to working-linear before spatial resampling."""
+    from .camera_color import decode_to_working
+
+    linear = decode_to_working(rgb_codes, str(meta["input_color_space"]))
+    linear = apply_linear_adjust(linear, meta)
+    h_out, w_out = meta["shape_hw"]
+    h_model, w_model = meta["model_native_hw"]
+    linear = resize_hwc_lanczos(linear, (h_model, w_model))
+    linear, _ = center_pad_to_shape(linear, h_out, w_out)
+    review_np = np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
+    review = torch.from_numpy(review_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    foundation_np = cu.linear_to_vfm_sdr(linear)
+    foundation = torch.from_numpy(
+        foundation_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    if not need_model:
+        return None, foundation, review
+    model_np = cu.linear_to_asinh(linear)
+    model = torch.from_numpy(model_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    return model, foundation, review
+
+
 def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
@@ -426,28 +451,45 @@ class SequentialVideoWindowReader:
     def __init__(self, video_path: str, meta: dict):
         self.video_path = video_path
         self.meta = meta
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
         self.start_frame = int(meta["start_frame"])
         self.n_frames = int(meta["num_frames"])
-        if self.start_frame:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.camera_reader = None
+        if meta.get("input_color_space", "legacy") != "legacy":
+            h, w = meta["native_hw"]
+            self.camera_reader = CameraVideoReader(
+                video_path, width=w, height=h,
+                input_range=meta.get("input_range", "auto"),
+                ffmpeg_bin=meta.get("ffmpeg_bin", "ffmpeg"),
+                total_frames=meta.get("total_frames"))
+            self.cap = None
+        else:
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Could not open video: {video_path}")
+            if self.start_frame:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
         self.next_t = 0
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def close(self):
-        self.cap.release()
+        if self.camera_reader is not None:
+            self.camera_reader.close()
+        if self.cap is not None:
+            self.cap.release()
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            ret, frame = self.cap.read()
-            if not ret:
-                raise RuntimeError(
-                    f"{self.video_path}: failed decoding frame "
-                    f"{self.start_frame + self.next_t}")
-            self.cache[self.next_t] = preprocess_video_frame_views(
-                frame, self.meta, need_model=True)
+            if self.camera_reader is not None:
+                codes = self.camera_reader.read_code_frame(self.start_frame + self.next_t)
+                views = preprocess_camera_code_views(codes, self.meta, need_model=True)
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    raise RuntimeError(
+                        f"{self.video_path}: failed decoding frame "
+                        f"{self.start_frame + self.next_t}")
+                views = preprocess_video_frame_views(frame, self.meta, need_model=True)
+            self.cache[self.next_t] = views
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
@@ -473,8 +515,13 @@ class SequentialFrameDirWindowReader:
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            self.cache[self.next_t] = preprocess_frame_dir_path(
-                self.paths[self.next_t], self.meta, need_model=True)
+            if self.meta.get("input_color_space", "legacy") != "legacy":
+                codes = read_frame_dir_codes(self.paths[self.next_t])
+                views = preprocess_camera_code_views(codes, self.meta, need_model=True)
+            else:
+                views = preprocess_frame_dir_path(
+                    self.paths[self.next_t], self.meta, need_model=True)
+            self.cache[self.next_t] = views
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
@@ -488,7 +535,38 @@ class SequentialFrameDirWindowReader:
 
 
 def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
-                            need_model: bool):
+                            need_model: bool, view: str = "foundation"):
+    if view not in ("foundation", "review"):
+        raise ValueError(f"unsupported frame view {view!r}")
+    if meta.get("input_color_space", "legacy") != "legacy":
+        h, w = meta["native_hw"]
+        reader = CameraVideoReader(video_path, width=w, height=h,
+                                   input_range=meta.get("input_range", "auto"),
+                                   ffmpeg_bin=meta.get("ffmpeg_bin", "ffmpeg"),
+                                   total_frames=meta.get("total_frames"))
+        t = 0
+        try:
+            while t < int(meta["num_frames"]):
+                model_list = [] if need_model else None
+                foundation_list = []
+                t0 = t
+                while t < int(meta["num_frames"]) and len(foundation_list) < chunk_size:
+                    codes = reader.read_code_frame(int(meta["start_frame"]) + t)
+                    model, foundation, review = preprocess_camera_code_views(
+                        codes, meta, need_model=need_model)
+                    if need_model:
+                        model_list.append(model)
+                    foundation_list.append(review if view == "review" else foundation)
+                    t += 1
+                if not foundation_list:
+                    break
+                yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
+        finally:
+            reader.close()
+        if t < int(meta["num_frames"]):
+            raise RuntimeError(
+                f"{video_path}: decoded only {t}/{meta['num_frames']} requested frames")
+        return
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -504,11 +582,11 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
                 ret, frame = cap.read()
                 if not ret:
                     break
-                model, foundation, _review = preprocess_video_frame_views(
+                model, foundation, review = preprocess_video_frame_views(
                     frame, meta, need_model=need_model)
                 if need_model:
                     model_list.append(model)
-                foundation_list.append(foundation)
+                foundation_list.append(review if view == "review" else foundation)
                 t += 1
             if not foundation_list:
                 break
@@ -521,7 +599,9 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
 
 
 def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
-                          need_model: bool):
+                          need_model: bool, view: str = "foundation"):
+    if view not in ("foundation", "review"):
+        raise ValueError(f"unsupported frame view {view!r}")
     paths = meta["frame_paths"]
     t = 0
     while t < len(paths):
@@ -529,11 +609,16 @@ def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
         model_list = [] if need_model else None
         foundation_list = []
         while t < len(paths) and len(foundation_list) < chunk_size:
-            model, foundation, _review = preprocess_frame_dir_path(
-                paths[t], meta, need_model=need_model)
+            if meta.get("input_color_space", "legacy") != "legacy":
+                codes = read_frame_dir_codes(paths[t])
+                model, foundation, review = preprocess_camera_code_views(
+                    codes, meta, need_model=need_model)
+            else:
+                model, foundation, review = preprocess_frame_dir_path(
+                    paths[t], meta, need_model=need_model)
             if need_model:
                 model_list.append(model)
-            foundation_list.append(foundation)
+            foundation_list.append(review if view == "review" else foundation)
             t += 1
         yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
 
@@ -691,7 +776,7 @@ def taper_weights(Tc: int, overlap: int, *, is_first: bool, is_last: bool,
 class ThreadedVideoWriter:
     def __init__(self, path: str, fps: float, size: tuple[int, int],
                  cfg: WriterConfig, *, maxsize: int = 2, channels: int = 3,
-                 color_trc: str | None = None):
+                 color_trc: str | None = None, tag_color: bool = True):
         self.path = path
         self.fps = float(fps)
         self.size = size
@@ -699,6 +784,7 @@ class ThreadedVideoWriter:
         self.maxsize = maxsize
         self.channels = channels
         self.color_trc = color_trc
+        self.tag_color = bool(tag_color)
         self.proc = None
         self.q = queue.Queue(maxsize=maxsize)
         self.err = None
@@ -735,13 +821,16 @@ class ThreadedVideoWriter:
             else:
                 cmd.extend(["-crf", str(int(self.cfg.crf))])
                 
-        trc = self.color_trc if self.color_trc is not None else "iec61966-2-1"
-        cmd.extend([
-            "-threads", str(max(1, self.cfg.threads)),
-            "-colorspace", "bt709", "-color_primaries", "bt709",
-            "-color_trc", trc, "-movflags", "+write_colr",
-            self.path
-        ])
+        cmd.extend(["-threads", str(max(1, self.cfg.threads))])
+        # YUV matrix metadata is independent from the RGB primaries/transfer.
+        # Camera-log source encodes keep BT.709 Y'CbCr matrix conversion but
+        # omit primaries/TRC tags rather than falsely labelling camera RGB.
+        cmd.extend(["-colorspace", "bt709"])
+        if self.tag_color:
+            trc = self.color_trc if self.color_trc is not None else "iec61966-2-1"
+            cmd.extend(["-color_primaries", "bt709", "-color_trc", trc,
+                        "-movflags", "+write_colr"])
+        cmd.append(self.path)
         
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         self.thread.start()

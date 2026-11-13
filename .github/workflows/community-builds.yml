@@ -20,6 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
+      - name: Ensure external video tools for runtime tests
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
       - name: Fetch OpenFX headers
         run: git clone --depth 1 --branch OFX_Release_1_4_TAG https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
       - name: Build and package the macOS OFX plugin
@@ -63,7 +70,8 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
             tests/test_device.py tests/test_window_batching.py tests/test_mps_attention.py \
             tests/test_frame_paths.py tests/test_preprocess_lut.py tests/test_asset_paths.py tests/test_linux_gui.py \
-            tests/test_ofx_protocol.py tests/test_ofx_worker.py tests/test_ofx_memory.py tests/test_media_probe.py
+            tests/test_ofx_protocol.py tests/test_ofx_worker.py tests/test_ofx_memory.py tests/test_media_probe.py \
+            tests/test_camera_color_gui.py tests/test_camera_video_runtime.py tests/test_camera_color_review.py
       - name: Upload Apple Silicon build
         uses: actions/upload-artifact@v4
         with:

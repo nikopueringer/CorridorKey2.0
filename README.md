@@ -163,6 +163,13 @@ pink/green cast despite returning frames successfully. The app and CLI reject
 this known decoder error. Export those clips from Resolve as ProRes 4444 or EXR,
 or use the OFX effect within Resolve at a supported processing resolution.
 
+## Camera log inputs
+
+Each queued clip can select a camera transfer function and gamut. Mathematical
+conversion feeds the model linear working RGB while preserving its HDR input
+contract. Choose processed working colour, processed camera colour, or original
+RGB with the new alpha. See [camera profiles, precision and output interpretation](docs/CAMERA_COLOR.md).
+
 ## Quick Start
 
 From the repository root:

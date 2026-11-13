@@ -167,7 +167,7 @@ QToolButton#iconButton:hover {{ background: #1c1c1a; border-color: {LINE_STRONG}
 QFrame#tabStrip {{ background: {CANVAS_2}; border: 1px solid {LINE}; border-radius: 2px; }}
 QToolButton#viewTab {{
     background: transparent; border: none; border-radius: 0;
-    border-bottom: 2px solid transparent; color: {MUTED}; padding: 5px 12px 3px 12px;
+    border-bottom: 2px solid transparent; color: {MUTED}; padding: 5px 7px 3px 7px;
 }}
 QToolButton#viewTab:hover {{ color: {TEXT}; background: transparent; }}
 QToolButton#viewTab:checked {{

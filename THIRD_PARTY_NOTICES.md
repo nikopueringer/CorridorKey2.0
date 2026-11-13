@@ -1,5 +1,14 @@
 # Third-Party Notices
 
+## Camera colour mathematics
+
+The optional camera-colour path uses [Colour 0.4.6](https://github.com/colour-science/colour/tree/v0.4.6),
+Copyright Colour Developers, under the BSD 3-Clause License. It evaluates
+analytic transfer functions and RGB matrices; it does not apply sampled LUTs.
+The distribution retains Colour's license in its installed package metadata.
+Camera profile definitions and additional formulas are attributed to the
+manufacturers' specifications in [the colour workflow guide](docs/CAMERA_COLOR.md).
+
 ## Optional native MPS attention
 
 `corridorkey/native/mps_attention.mm` adapts the unmasked MPSGraph attention

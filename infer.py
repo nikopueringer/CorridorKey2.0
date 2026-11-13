@@ -84,6 +84,15 @@ def main():
     ap.add_argument("--model_scale", type=float, default=1.0,
                     help="Lanczos scale before model inference; 1.0 is native.")
     ap.add_argument("--frame_dir_fps", type=float, default=24.0)
+    ap.add_argument("--input_color_space", default="legacy",
+                    help="Camera log/gamut profile ID, or legacy (default).")
+    ap.add_argument("--color_output",
+                    choices=("processed_working", "processed_source", "source_rgb"),
+                    default="processed_working",
+                    help="Output RGB policy; source_rgb requires EXR and uses float precision.")
+    ap.add_argument("--input_range", choices=("auto", "full", "legal"),
+                    default="auto",
+                    help="Video signal range override passed to FFmpeg camera decode.")
     ap.add_argument("--frame_dir_linear", action="store_true",
                     help="Treat frame-directory inputs as scene-linear RGB.")
     ap.add_argument("--cutout_linear", action="store_true",
@@ -97,7 +106,8 @@ def main():
                     default="video",
                     help=("video: ffmpeg-encoded preview videos (display-"
                           "referred, clipped to [0,1]). exr: unclamped scene-"
-                          "linear OpenEXR image sequences (full HDR float)."))
+                          "linear OpenEXR image sequences (full HDR float), "
+                          "or source-encoded RGB with a source color policy."))
     ap.add_argument("--exr_dtype", choices=("half", "float"), default="half",
                     help="EXR pixel type for --output_format exr. Default: half.")
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
@@ -165,6 +175,9 @@ def main():
         linear_contrast=args.linear_contrast,
         linear_contrast_pivot=args.linear_contrast_pivot,
         frame_dir_fps=args.frame_dir_fps,
+        input_color_space=args.input_color_space,
+        color_output=args.color_output,
+        input_range=args.input_range,
         frame_dir_linear=args.frame_dir_linear,
         cutout_linear=args.cutout_linear,
         despill_strength=args.despill_strength,

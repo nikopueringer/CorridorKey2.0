@@ -25,6 +25,8 @@ class JobSettings:
     output_format: str = "video"     # video | exr
     exr_dtype: str = "half"          # half | float
     cutout_linear: bool = False
+    color_output: str = "processed_working"
+    input_range: str = "auto"
     despill_strength: float = 0.5
     hint_quality: float = 0.75
     carry_hint: bool = True
@@ -61,6 +63,12 @@ def frames_are_linear(clip: Clip, settings: JobSettings) -> bool:
 
 def infer_args(clip: Clip, s: JobSettings, output_dir: Path) -> list[str]:
     args = [str(INFER), "--input", str(clip.source), "--output_dir", str(output_dir)]
+    if clip.input_color_space != "legacy":
+        args += ["--input_color_space", clip.input_color_space]
+    if s.color_output != "processed_working":
+        args += ["--color_output", s.color_output]
+    if clip.input_color_space != "legacy" and s.input_range != "auto" and not clip.is_frames:
+        args += ["--input_range", s.input_range]
     if clip.hint_path is not None and clip.hint_kind == HINT_FIRST_FRAME:
         args += ["--hint_first_frame", str(clip.hint_path)]
     elif clip.hint_path is not None and clip.hint_kind == HINT_VIDEO:
@@ -70,15 +78,16 @@ def infer_args(clip: Clip, s: JobSettings, output_dir: Path) -> list[str]:
         args += ["--carry_hint_quality", f"{s.carry_hint_quality:g}"]
     else:
         args.append("--no_carry_hint")
-    args += ["--outputs", *s.outputs, "--output_format", s.output_format]
-    if s.output_format == "exr":
-        args += ["--exr_dtype", s.exr_dtype]
+    output_format = "exr" if s.color_output == "source_rgb" else s.output_format
+    args += ["--outputs", *s.outputs, "--output_format", output_format]
+    if output_format == "exr":
+        args += ["--exr_dtype", "float" if s.color_output == "source_rgb" else s.exr_dtype]
     elif s.cutout_linear:
         args.append("--cutout_linear")
     args += ["--despill_strength", f"{s.despill_strength:g}"]
     if clip.is_frames:
         args += ["--frame_dir_fps", f"{s.frame_dir_fps:g}"]
-        if frames_are_linear(clip, s):
+        if frames_are_linear(clip, s) and clip.input_color_space == "legacy":
             args.append("--frame_dir_linear")
     # With no memory flags, infer.py sizes the windows from free GPU memory.
     if not s.auto_vram:

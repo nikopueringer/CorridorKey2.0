@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         self.queue.open_folder.connect(self.open_output_folder)
         self.viewer.open_folder.connect(self.open_output_folder)
         self.clip_box.edited.connect(self.queue.refresh)
+        self.clip_box.edited.connect(lambda _clip: self._show_selection())
         self.settings.changed.connect(self._show_selection)
         self.runner.clip_started.connect(self._on_clip_started)
         self.runner.clip_changed.connect(self._on_clip_changed)
@@ -263,9 +264,13 @@ class MainWindow(QMainWindow):
         self.clip_box.set_clips(clips)
         clip = clips[0] if clips else None
         self.settings.set_sequence_source(clip.is_frames if clip is not None else None)
+        self.settings.set_camera_profile_selected(
+            bool(clips) and any(item.input_color_space != "legacy" for item in clips),
+            video=bool(clips) and any(not item.is_frames for item in clips))
         settings = self.settings.settings()
         self.viewer.set_sequence_fps(settings.frame_dir_fps)
         self.viewer.set_cutout_linear(settings.cutout_linear)
+        self.viewer.set_input_range(settings.input_range)
         self.viewer.set_clip(clip, self._outputs(clip))
 
     def run_queue(self) -> None:

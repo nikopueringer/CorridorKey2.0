@@ -40,12 +40,14 @@ class SettingsPanel(QScrollArea):
         super().__init__(parent)
         self._loading = False
         self._sequence_source: bool | None = None
+        self._camera_profile_selected = False
         body = QWidget()
         column = QVBoxLayout(body)
         column.setContentsMargins(0, 0, 6, 0)
         column.setSpacing(0)
         for section in (self._outputs_group(), self._hints_group(), self._memory_group(),
-                        self._frames_group(), self._range_group(), self._folder_group()):
+                        self._frames_group(), self._color_group(), self._range_group(),
+                        self._folder_group()):
             column.addWidget(section)
         column.addStretch(1)
         self.setWidget(body)
@@ -153,6 +155,31 @@ class SettingsPanel(QScrollArea):
         self.fps.valueChanged.connect(self._on_change)
         return box
 
+    def _color_group(self) -> Section:
+        box = Section("Camera colour", expanded=False)
+        form = box.form
+        self.color_output = combo([
+            ("Processed · working RGB", "processed_working"),
+            ("Processed · camera profile", "processed_source"),
+            ("Original RGB + new alpha", "source_rgb"),
+        ])
+        self.color_output.setToolTip("Working output uses Rec.709 primaries (linear EXR, sRGB video). "
+                                     "Camera-profile output uses the selected camera log/gamut in EXR and video. "
+                                     "Original RGB bypasses despill and automatically switches to float EXR.")
+        self.input_range = combo([("Auto from metadata", "auto"),
+                                  ("Full range", "full"), ("Legal / video range", "legal")])
+        self.input_range.setToolTip("Override the video code-value range when metadata is wrong.")
+        self.color_warning = QLabel("Input profile is selected per clip. "
+                                    "Original RGB + new alpha bypasses despill.")
+        self.color_warning.setObjectName("subtle")
+        self.color_warning.setWordWrap(True)
+        form.addRow("Foreground output", self.color_output)
+        form.addRow("Input code range", self.input_range)
+        form.addRow(self.color_warning)
+        self.color_output.currentIndexChanged.connect(self._on_change)
+        self.input_range.currentIndexChanged.connect(self._on_change)
+        return box
+
     def _range_group(self) -> Section:
         box = Section("Frame range", expanded=False)
         form = box.form
@@ -186,9 +213,12 @@ class SettingsPanel(QScrollArea):
         custom_folder = self.out_mode.currentData() == "custom"
         return JobSettings(
             outputs=[key for key in ALL_OUTPUTS if self.outputs[key].isChecked()],
-            output_format=self.format.currentData(),
+            output_format=("exr" if self.color_output.currentData() == "source_rgb"
+                           else self.format.currentData()),
             exr_dtype=self.exr_dtype.currentData(),
             cutout_linear=self.cutout_colour.currentData() == "linear",
+            color_output=self.color_output.currentData(),
+            input_range=self.input_range.currentData(),
             despill_strength=round(self.despill.value(), 3),
             hint_quality=round(self.hint_quality.value(), 3),
             carry_hint=self.carry.isChecked(),
@@ -214,6 +244,8 @@ class SettingsPanel(QScrollArea):
         select(self.format, s.output_format)
         select(self.exr_dtype, s.exr_dtype)
         select(self.cutout_colour, "linear" if s.cutout_linear else "srgb")
+        select(self.color_output, s.color_output)
+        select(self.input_range, s.input_range)
         self.despill.setValue(s.despill_strength)
         self.hint_quality.setValue(s.hint_quality)
         self.carry.setChecked(s.carry_hint)
@@ -233,6 +265,10 @@ class SettingsPanel(QScrollArea):
         select(self.out_mode, "custom" if s.output_parent else "beside")
         self.out_parent.setText(s.output_parent)
         self._loading = False
+        if self.color_output.currentData() == "source_rgb":
+            self.format.blockSignals(True)
+            select(self.format, "exr")
+            self.format.blockSignals(False)
         self._sync_enabled()
 
     def set_sequence_source(self, is_sequence: bool | None) -> None:
@@ -240,9 +276,21 @@ class SettingsPanel(QScrollArea):
         self._sequence_source = is_sequence
         self._sync_enabled()
 
+    def set_camera_profile_selected(self, selected: bool, video: bool = True) -> None:
+        self._camera_profile_selected = selected
+        self._camera_profile_video_selected = video
+        if not selected and self.input_range.currentData() != "auto":
+            select(self.input_range, "auto")
+            self._on_change()
+        self._sync_enabled()
+
     def _on_change(self) -> None:
         if self._loading:
             return
+        if self.color_output.currentData() == "source_rgb" and self.format.currentData() != "exr":
+            self.format.blockSignals(True)
+            select(self.format, "exr")
+            self.format.blockSignals(False)
         self._sync_enabled()
         QSettings().setValue(SETTINGS_KEY, json.dumps(self.settings().to_dict()))
         self.changed.emit()
@@ -280,9 +328,27 @@ class SettingsPanel(QScrollArea):
     def _sync_enabled(self) -> None:
         outputs = {key for key, check in self.outputs.items() if check.isChecked()}
         exr = self.format.currentData() == "exr"
-        self.exr_dtype.setEnabled(exr)
+        policy = self.color_output.currentData()
+        if policy == "processed_source":
+            format_tip = ("Foreground and cutout use the selected camera log/gamut in both video and EXR outputs. "
+                          "EXR stores the camera-encoded values as float.")
+        elif policy == "source_rgb":
+            format_tip = "Original RGB with the new alpha is preserved in a float EXR sequence."
+        else:
+            format_tip = ("Working RGB uses Rec.709 primaries: video is sRGB encoded; EXR is scene-linear. "
+                          "Video is clipped to its representable range.")
+        self.format.setToolTip(format_tip)
+        self.exr_dtype.setEnabled(exr and self.color_output.currentData() != "source_rgb")
+        self.exr_dtype.setToolTip("Original RGB output is written as float EXR for precision."
+                                  if self.color_output.currentData() == "source_rgb" else "EXR precision.")
         self.cutout_colour.setEnabled("cutout" in outputs and not exr)
-        self.despill.setEnabled(bool(outputs & {"cutout", "checker"}))
+        self.despill.setEnabled(bool(outputs & {"cutout", "checker"}) and
+                                self.color_output.currentData() != "source_rgb")
+        self.color_output.setEnabled(True)
+        self.input_range.setEnabled(self._camera_profile_selected and
+                                    getattr(self, "_camera_profile_video_selected", True))
+        self.color_warning.setVisible(self._camera_profile_selected or
+                                      self.color_output.currentData() == "source_rgb")
         self.carry_quality.setEnabled(self.carry.isChecked())
         manual = self.vram_mode.currentData() == "manual"
         self.low_vram.setEnabled(manual)

@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -131,6 +131,9 @@ class InferenceConfig:
     despill_strength: float = 0.5
     output_format: str = "video"
     exr_dtype: str = "half"
+    input_color_space: str = "legacy"
+    color_output: str = "processed_working"
+    input_range: str = "auto"
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -783,9 +786,96 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     return rendered
 
 
+def _replace_rendered_rgb_with_source(rendered: dict[str, np.ndarray],
+                                      source_frames: list[np.ndarray]):
+    """Preserve native decoded source RGB while keeping inferred alpha straight."""
+    source_bgr = np.stack([frame[..., ::-1] for frame in source_frames])
+    if "fg" in rendered:
+        rendered["fg"] = source_bgr.astype(np.float32, copy=False)
+    if "cutout" in rendered:
+        alpha = rendered["cutout"][..., 3:4]
+        rendered["cutout"] = np.concatenate((source_bgr, alpha), axis=-1).astype(
+            np.float32, copy=False)
+    return rendered
+
+
+def _write_color_manifest(path: str | os.PathLike, manifest: dict) -> None:
+    """Atomically update selected output descriptions, preserving old files."""
+    path = Path(path)
+    merged = dict(manifest)
+    outputs = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing.get("outputs"), dict):
+                outputs.update(existing["outputs"])
+        except (OSError, ValueError, TypeError):
+            pass
+    outputs.update(manifest.get("outputs", {}))
+    merged["outputs"] = outputs
+    temp_path = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as mf:
+            json.dump(merged, mf, indent=2)
+            mf.write("\n")
+            mf.flush()
+            os.fsync(mf.fileno())
+        os.replace(temp_path, path)
+    finally:
+        safe_remove(temp_path)
+
+
+def _encode_rendered_camera_source(rendered: dict[str, np.ndarray],
+                                   profile_id: str, *, video: bool,
+                                   legacy_linear: bool = False):
+    """Convert unclamped working-linear render arrays to camera-log output.
+
+    EXR retains signed and over-range camera code values. Video output must
+    quantize to its representable range, but its camera primaries/TRC tags are
+    intentionally omitted by the writer.
+    """
+    if profile_id == "legacy" and not legacy_linear:
+        encode_rgb = lambda rgb: cu.linear_to_srgb(np.maximum(rgb, 0.0))
+    elif profile_id == "legacy":
+        encode_rgb = lambda rgb: rgb
+    else:
+        from .camera_color import encode_from_working
+        encode_rgb = lambda rgb: encode_from_working(rgb, profile_id)
+    if "fg" in rendered:
+        rendered["fg"] = np.ascontiguousarray(
+            encode_rgb(rendered["fg"][..., ::-1])[..., ::-1])
+    if "cutout" in rendered:
+        cutout = rendered["cutout"]
+        rgb = encode_rgb(cutout[..., 2::-1])
+        rendered["cutout"] = np.concatenate(
+            (rgb[..., ::-1], cutout[..., 3:4]), axis=-1)
+    if video:
+        for name in ("fg", "cutout"):
+            if name in rendered:
+                rendered[name] = (
+                    np.clip(rendered[name], 0.0, 1.0) * 65535.0
+                ).astype(np.uint16)
+        if "checker" in rendered:
+            checker_rgb = rendered["checker"][..., ::-1]
+            checker_srgb = np.clip(
+                cu.linear_to_srgb(np.maximum(checker_rgb, 0.0)), 0.0, 1.0)
+            rendered["checker"] = (
+                checker_srgb[..., ::-1] * 65535.0
+            ).astype(np.uint16)
+        if "alpha" in rendered:
+            alpha = np.clip(rendered["alpha"], 0.0, 1.0)
+            alpha_rgb = np.repeat(alpha, 3, axis=-1)
+            rendered["alpha"] = (alpha_rgb * 65535.0).astype(np.uint16)
+    return rendered
+
+
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
+    # Half EXR cannot retain adjacent 16-bit source codes. Apply the same
+    # fidelity guarantee to CLI/API callers as to the desktop output control.
+    if cfg.color_output == "source_rgb" and cfg.exr_dtype != "float":
+        cfg = replace(cfg, exr_dtype="float")
     device = model_device(model)
     input_path = str(input_path)
     output_dir = str(output_dir)
@@ -799,7 +889,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, fps=cfg.frame_dir_fps,
             exr_linear=cfg.frame_dir_linear, model_scale=cfg.model_scale)
-        if (not cfg.frame_dir_linear
+        if (cfg.input_color_space == "legacy" and not cfg.frame_dir_linear
                 and meta["frame_paths"]
                 and meta["frame_paths"][0].lower().endswith(".exr")):
             print("  [WARNING] EXR input frames are being treated as "
@@ -814,6 +904,29 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
             linear_contrast_pivot=cfg.linear_contrast_pivot)
+    if cfg.input_range not in ("auto", "full", "legal"):
+        raise ValueError(f"unsupported input range {cfg.input_range!r}")
+    if cfg.color_output not in ("processed_working", "processed_source", "source_rgb"):
+        raise ValueError(f"unsupported color output {cfg.color_output!r}")
+    effective_color_output = cfg.color_output
+    if cfg.input_color_space != "legacy":
+        from .camera_color import PROFILES
+        if cfg.input_color_space not in PROFILES:
+            raise ValueError(f"unknown input color space {cfg.input_color_space!r}")
+    if effective_color_output == "source_rgb" and cfg.output_format != "exr":
+        raise ValueError("source_rgb requires --output_format exr to preserve source codes")
+    elif (effective_color_output == "processed_source" and is_dir
+          and cfg.frame_dir_linear and cfg.output_format != "exr"):
+        raise ValueError(
+            "processed_source for linear frame sequences requires --output_format exr")
+    meta["input_color_space"] = cfg.input_color_space
+    meta["color_output"] = effective_color_output
+    meta["input_range"] = cfg.input_range
+    meta["ffmpeg_bin"] = writer_cfg.ffmpeg_bin
+    if is_dir and cfg.input_color_space != "legacy":
+        meta["linear_brightness"] = float(cfg.linear_brightness)
+        meta["linear_contrast"] = float(cfg.linear_contrast)
+        meta["linear_contrast_pivot"] = float(cfg.linear_contrast_pivot)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
@@ -826,6 +939,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
+    source_reader = None
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -851,8 +965,60 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 color_trc = "linear" if (name == "cutout" and cfg.cutout_linear) else "iec61966-2-1"
                 writers[name] = ThreadedVideoWriter(
                     os.path.join(output_dir, f"{clip_name}_{suffix[name]}{ext}"),
-                    fps, (W_out, H_out), writer_cfg, channels=channels, color_trc=color_trc)
+                    fps, (W_out, H_out), writer_cfg, channels=channels,
+                    color_trc=color_trc,
+                    tag_color=not (
+                        cfg.input_color_space != "legacy"
+                        and effective_color_output == "processed_source"
+                        and name in ("fg", "cutout")))
 
+        if effective_color_output == "source_rgb" and not is_dir:
+            from .camera_video import CameraVideoReader
+            source_reader = CameraVideoReader(
+                input_path, width=int(meta["native_hw"][1]),
+                height=int(meta["native_hw"][0]),
+                input_range=cfg.input_range, ffmpeg_bin=writer_cfg.ffmpeg_bin)
+
+        output_profiles = {}
+        source_output_profile = (
+            cfg.input_color_space if cfg.input_color_space != "legacy" else
+            ("linear_rec709" if is_dir and cfg.frame_dir_linear else "srgb"))
+        for name in cfg.outputs:
+            if name == "alpha":
+                output_profiles[name] = {"profile": "matte", "data": "matte"}
+            elif name == "checker":
+                output_profiles[name] = {
+                    "profile": "linear_rec709" if use_exr else "srgb"}
+            elif effective_color_output in ("processed_source", "source_rgb"):
+                output_profiles[name] = {
+                    "profile": source_output_profile,
+                    **({"alpha": "straight"} if name == "cutout" else {}),
+                }
+            else:
+                output_profiles[name] = {
+                    "profile": ("linear_rec709" if use_exr else
+                                ("linear_rec709" if name == "cutout" and cfg.cutout_linear
+                                 else "srgb")),
+                    **({"alpha": "straight"} if name == "cutout" else {}),
+                }
+            extension = "_exr" if use_exr else (".mov" if name == "cutout" else ".mp4")
+            output_profiles[name]["path"] = f"{clip_name}_{suffix[name]}{extension}"
+            output_profiles[name]["native_fps"] = fps
+        color_manifest = {
+            "schema_version": 1,
+            "native_fps": fps,
+            "input_color_space": cfg.input_color_space,
+            "color_output": effective_color_output,
+            "input_range": cfg.input_range,
+            "outputs": output_profiles,
+        }
+        if (cfg.input_color_space != "legacy"
+                and effective_color_output == "processed_source"
+                and not use_exr):
+            color_manifest["video_note"] = (
+                "Camera-log RGB was clipped to [0,1] and encoded through a lossy "
+                "video codec. Camera primaries/TRC tags are omitted; Y'CbCr "
+                "matrix metadata is BT.709. Use EXR for unclipped float output.")
         # Write settings log file in the output folder
         settings_path = os.path.join(output_dir, f"{clip_name}_settings.txt")
         try:
@@ -875,6 +1041,14 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 sf.write(f"Despill Strength: {cfg.despill_strength}\n")
                 sf.write(f"Cutout Linear: {cfg.cutout_linear}\n")
                 sf.write(f"Frame Dir Linear: {cfg.frame_dir_linear}\n")
+                sf.write(f"Input Color Space: {cfg.input_color_space}\n")
+                sf.write(f"Color Output: {effective_color_output}\n")
+                sf.write(f"Input Range: {cfg.input_range}\n")
+                if (cfg.input_color_space != "legacy"
+                        and effective_color_output == "processed_source"
+                        and not use_exr):
+                    sf.write("Camera-log video output is clipped/quantized and lossy; "
+                             "camera primaries/TRC tags are omitted.\n")
                 sf.write(f"Hann Chunk: {cfg.hann_chunk}\n")
                 sf.write(f"Hann Stride: {cfg.hann_stride}\n")
                 sf.write(f"Low VRAM: {cfg.low_vram}\n")
@@ -928,6 +1102,48 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
 
         stage2_batch = max(1, int(cfg.stage2_batch))
 
+        def original_source_codes(relative_index: int) -> np.ndarray:
+            absolute_index = int(meta["start_frame"]) + int(relative_index)
+            if is_dir:
+                from .camera_video import read_frame_dir_codes
+                return read_frame_dir_codes(meta["frame_paths"][absolute_index])
+            if source_reader is None:
+                raise RuntimeError("source RGB reader was not initialized")
+            return source_reader.read_code_frame(absolute_index)
+
+        def apply_color_output(rendered, sub):
+            if effective_color_output == "processed_working":
+                return rendered
+            if effective_color_output == "processed_source":
+                return _encode_rendered_camera_source(
+                    rendered, cfg.input_color_space, video=not use_exr,
+                    legacy_linear=is_dir and cfg.frame_dir_linear)
+
+            # source_rgb keeps the decoded source codes at native dimensions;
+            # only the inferred straight-alpha matte comes from the model.
+            if not (cfg.outputs & {"fg", "cutout", "checker"}):
+                return rendered
+            source_frames = [original_source_codes(item[0]) for item in sub]
+            source_alpha = (rendered["cutout"][..., 3:4]
+                            if "cutout" in rendered else rendered.get("alpha"))
+            rendered = _replace_rendered_rgb_with_source(rendered, source_frames)
+            if "checker" in rendered and source_alpha is not None:
+                bg_srgb = checker_t.permute(1, 2, 0).cpu().numpy()[None]
+                bg_linear = cu.srgb_to_linear(bg_srgb)
+                checker_frames = []
+                for source_codes, alpha in zip(source_frames, source_alpha):
+                    if cfg.input_color_space == "legacy":
+                        source_linear = (source_codes if is_dir and cfg.frame_dir_linear
+                                         else cu.srgb_to_linear(source_codes))
+                    else:
+                        from .camera_color import decode_to_working
+                        source_linear = decode_to_working(
+                            source_codes, cfg.input_color_space)
+                    comp = source_linear * alpha + bg_linear[0] * (1.0 - alpha)
+                    checker_frames.append(comp[..., ::-1])
+                rendered["checker"] = np.stack(checker_frames).astype(np.float32)
+            return rendered
+
         def write_prediction_batches(items):
             device = next(model.stage2.parameters()).device
             for offset in range(0, len(items), stage2_batch):
@@ -941,9 +1157,18 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
-                render_fn = (_render_predictions_exr_torch if use_exr
+                render_fn = (_render_predictions_exr_torch
+                             if use_exr or effective_color_output == "processed_source"
                              else _render_predictions_torch)
-                rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
+                render_outputs = set(cfg.outputs)
+                if (effective_color_output == "source_rgb"
+                        and "checker" in cfg.outputs
+                        and not (cfg.outputs & {"alpha", "cutout"})):
+                    render_outputs.add("alpha")
+                rendered = render_fn(meta, render_outputs, checker_t, logits[0])
+                rendered = apply_color_output(rendered, sub)
+                for hidden in set(rendered) - set(cfg.outputs):
+                    del rendered[hidden]
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
                 del logits, baton_t, rgb_t, baton_np, rendered
@@ -980,6 +1205,12 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader.close()
                 del baton
     finally:
+        camera_close_error = None
+        if source_reader is not None:
+            try:
+                source_reader.close()
+            except Exception as exc:
+                camera_close_error = exc
         for writer in writers.values():
             writer.release()
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
@@ -987,5 +1218,13 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
         empty_cache(device)
-    print(f"  wrote {len(writers)} output video(s) for {clip_name} "
+        if camera_close_error is not None:
+            if sys.exc_info()[0] is None:
+                raise camera_close_error
+            print(f"[WARNING] Camera source decoder close reported: {camera_close_error}")
+    # Publish the interpretation only after every selected output is closed
+    # successfully; a failed attempt must not relabel an older completed render.
+    _write_color_manifest(
+        os.path.join(output_dir, f"{clip_name}_color.json"), color_manifest)
+    print(f"  wrote {len(writers)} output(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")

@@ -9,6 +9,8 @@ safetensors>=0.6
 huggingface-hub>=0.36
 einops>=0.8
 scipy>=1.16
+# Analytic camera transfer functions and gamut matrices; no LUT conversion.
+colour-science==0.4.6
 pillow>=11
 tqdm>=4.67
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd

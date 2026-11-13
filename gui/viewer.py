@@ -1,12 +1,15 @@
 """Frame viewer: the selected clip's input or any of its outputs, with a scrubber."""
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -25,6 +28,14 @@ VIEWS = (("input", "Input"), ("alpha", "Alpha"), ("fg", "Foreground"),
          ("cutout", "Cutout"), ("checker", "Checker"))
 PLACEHOLDER = ("Drop clips or frame folders here. Select a clip, then click Run queue "
                "below to create output previews.")
+
+
+def _positive_fps(value) -> float | None:
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return None
+    return fps if math.isfinite(fps) and fps > 0 else None
 
 
 class ImageView(QWidget):
@@ -138,6 +149,13 @@ class ViewerPanel(QWidget):
         self._fps = 24.0
         self._sequence_fps = 24.0
         self._cutout_linear = False
+        self._input_range = "auto"
+        self._input_profile = "legacy"
+        self._output_profiles: dict[str, str] = {}
+        self._output_fps: dict[str, float | None] = {}
+        self._manifest_native_fps: float | None = None
+        self._input_fps: float | None = None
+        self._display_transform = True
         self._waiting = False
         self._transport: list[QToolButton] = []
 
@@ -164,6 +182,13 @@ class ViewerPanel(QWidget):
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(strip)
         top.addStretch(1)
+        self.view_transform = QCheckBox("View transform")
+        self.view_transform.setToolTip("Decode the selected camera log/gamut to display sRGB. "
+                                       "This affects only the Input preview.")
+        self.view_transform.setChecked(True)
+        self.view_transform.setVisible(False)
+        self.view_transform.toggled.connect(self._set_view_transform)
+        top.addWidget(self.view_transform)
         self.zoom_label = QLabel()
         self.zoom_label.setObjectName("subtle")
         top.addWidget(self.zoom_label)
@@ -232,8 +257,32 @@ class ViewerPanel(QWidget):
         if clip is not self._clip:
             self.stop()
             self._index = 0
+            self._input_fps = None
         self._clip = clip
         self._paths = {"input": clip.source, **outputs} if clip else {}
+        self._input_profile = clip.input_color_space if clip else "legacy"
+        self._output_profiles = {}
+        self._output_fps = {}
+        self._manifest_native_fps = None
+        if clip and outputs:
+            sidecar = next(iter(outputs.values())).parent / f"{clip.name}_color.json"
+            try:
+                metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+                self._output_profiles = {
+                    key: value["profile"] for key, value in metadata.get("outputs", {}).items()
+                    if key in outputs and isinstance(value, dict) and value.get("profile")
+                    and value.get("path", outputs[key].name) == outputs[key].name
+                }
+                self._output_fps = {
+                    key: _positive_fps(value.get("native_fps"))
+                    for key, value in metadata.get("outputs", {}).items()
+                    if key in self._output_profiles and isinstance(value, dict)
+                }
+                self._manifest_native_fps = _positive_fps(metadata.get("native_fps"))
+            except (OSError, ValueError, TypeError, AttributeError):
+                # Older outputs have no color manifest; retain their historical
+                # EXR-linear / video-sRGB interpretation.
+                self._output_profiles = {}
         for button in self.tabs.buttons():
             key = button.property("view")
             button.setEnabled(key in self._paths)
@@ -242,6 +291,7 @@ class ViewerPanel(QWidget):
         if self._view not in self._paths:
             self._view = "input"
         self._check_tab()
+        self.view_transform.setVisible(self._input_profile != "legacy" and self._view == "input")
         for widget in (self.folder_button, self.slider, *self._transport):
             widget.setEnabled(clip is not None)
         self.image.placeholder = PLACEHOLDER
@@ -262,6 +312,14 @@ class ViewerPanel(QWidget):
     def set_cutout_linear(self, linear: bool) -> None:
         self._cutout_linear = linear
 
+    def set_input_range(self, value: str) -> None:
+        self._input_range = value
+
+    def _set_view_transform(self, enabled: bool) -> None:
+        self._display_transform = enabled
+        if self._view == "input":
+            self._request()
+
     def has_view(self, key: str) -> bool:
         return key in self._paths
 
@@ -269,6 +327,7 @@ class ViewerPanel(QWidget):
         if key in self._paths:
             self._view = key
             self._check_tab()
+            self.view_transform.setVisible(self._input_profile != "legacy" and key == "input")
             self._request()
 
     def step(self, delta: int) -> None:
@@ -305,11 +364,24 @@ class ViewerPanel(QWidget):
 
     def _request(self) -> None:
         self._waiting = True
+        input_view = self._view == "input"
+        profile_id = self._input_profile if input_view else self._output_profiles.get(self._view, "legacy")
+        cutout_linear = self._cutout_linear
+        if self._view == "cutout" and self._view in self._output_profiles:
+            cutout_linear = profile_id == "linear_rec709"
+        sequence_fps = self._sequence_fps
+        if not input_view and self._paths[self._view].is_dir():
+            sequence_fps = (self._output_fps.get(self._view) or
+                            self._manifest_native_fps or self._input_fps or
+                            self._sequence_fps)
         self.loader.request(self._paths[self._view], self._index,
                             linear_float=self._view != "alpha",
                             cutout=self._view == "cutout",
-                            sequence_fps=self._sequence_fps,
-                            cutout_linear=self._cutout_linear)
+                            sequence_fps=sequence_fps,
+                            cutout_linear=cutout_linear,
+                            profile_id=profile_id,
+                            display_transform=self._display_transform if input_view else True,
+                            input_range=self._input_range if input_view else "auto")
 
     def _tick(self) -> None:
         if not self._waiting and self._count:
@@ -329,6 +401,8 @@ class ViewerPanel(QWidget):
             return
         self._waiting = False
         self._index, self._count, self._fps = index, count, fps
+        if self._clip is not None and path == str(self._clip.source) and not self._clip.is_frames:
+            self._input_fps = _positive_fps(fps)
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, count - 1))
         self.slider.setValue(index)
