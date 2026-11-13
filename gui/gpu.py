@@ -18,6 +18,12 @@ class GpuMonitor(QObject):
             self._timer.start(interval_ms)
             QTimer.singleShot(0, self._poll)
 
+    def shutdown(self) -> None:
+        self._timer.stop()
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.waitForFinished(1000)
+
     def _poll(self) -> None:
         if self._proc is not None:
             return

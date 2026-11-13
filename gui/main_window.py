@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import sys
 
 from PySide6.QtCore import QSettings, QSize, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QShortcut
@@ -38,6 +39,7 @@ from .clips import (
 from .frames import FrameLoader
 from .gpu import GpuMonitor
 from .runner import QueueRunner
+from .resolve_engine import ResolveEngine
 from .settings_panel import SettingsPanel
 from .theme import font, icon_path, panel_title
 from .viewer import ViewerPanel
@@ -49,13 +51,14 @@ CLIP_FILTER = (f"Clips ({' '.join('*' + ext for ext in sorted(VIDEO_EXTS))});;"
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CorridorKey 2.0")
+        self.setWindowTitle("CorridorKey 2.0 · Community Linux build" if sys.platform.startswith("linux") else "CorridorKey 2.0")
         self.resize(1480, 900)
         self.setAcceptDrops(True)
         self._counts: Counter[str] = Counter()
 
         self.loader = FrameLoader(self)
         self.runner = QueueRunner(self)
+        self.engine = ResolveEngine(self)
         self.gpu = GpuMonitor(self)
         self.queue = ClipList()
         self.viewer = ViewerPanel(self.loader)
@@ -92,6 +95,13 @@ class MainWindow(QMainWindow):
         row.addWidget(wordmark, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addStretch(1)
+        self.engine_status = QLabel("Single-frame OFX · temporal keying in the queue")
+        self.engine_status.setObjectName("subtle")
+        self.engine_button = QPushButton("Start Resolve engine")
+        self.engine_button.setToolTip("Load the CUDA model for the Linux OFX plugin. Queue rendering stops the engine to release GPU memory.")
+        if sys.platform.startswith("linux"):
+            row.addWidget(self.engine_status)
+            row.addWidget(self.engine_button)
         return header
 
     def _build(self) -> QWidget:
@@ -184,6 +194,9 @@ class MainWindow(QMainWindow):
         self.runner.clip_changed.connect(self._on_clip_changed)
         self.runner.log.connect(self.log.appendPlainText)
         self.runner.finished.connect(self._on_run_finished)
+        self.engine.log.connect(self.log.appendPlainText)
+        self.engine.changed.connect(self._engine_changed)
+        self.engine_button.clicked.connect(self._toggle_engine)
         self.gpu.changed.connect(self.gpu_label.setText)
         self.log_toggle.toggled.connect(self.log.setVisible)
         self.run_button.clicked.connect(self.run_queue)
@@ -254,6 +267,8 @@ class MainWindow(QMainWindow):
                 return
             for clip in selected:
                 self.queue.requeue(clip)
+        self.engine.stop()
+        self.engine_button.setEnabled(False)
         self._counts.clear()
         self.loader.release()
         self.settings.setEnabled(False)
@@ -285,6 +300,7 @@ class MainWindow(QMainWindow):
                         break
 
     def _on_run_finished(self) -> None:
+        self.engine_button.setEnabled(True)
         self.settings.setEnabled(True)
         self.run_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -293,6 +309,16 @@ class MainWindow(QMainWindow):
                  for s in (DONE, FAILED, STOPPED) if self._counts[s]]
         self.status.setText("Run finished: " + ", ".join(parts) + "." if parts else "Run finished.")
         self.clip_box.refresh()
+
+    def _toggle_engine(self) -> None:
+        if self.engine.proc is None:
+            self.engine.start()
+        else:
+            self.engine.stop()
+
+    def _engine_changed(self, message: str) -> None:
+        self.engine_status.setText(message)
+        self.engine_button.setText("Stop Resolve engine" if self.engine.proc else "Start Resolve engine")
 
     def report_error(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -337,4 +363,6 @@ class MainWindow(QMainWindow):
         store.setValue("window/vsplit", self.vsplit.saveState())
         store.setValue("window/log", self.log_toggle.isChecked())
         self.loader.shutdown()
+        self.engine.stop()
+        self.gpu.shutdown()
         event.accept()

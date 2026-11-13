@@ -9,8 +9,8 @@ else
 fi
 
 if ! "$PYTHON" -c "import PySide6" 2>/dev/null; then
-    echo "Installing the UI toolkit (PySide6)..."
-    "$PYTHON" -m pip install PySide6-Essentials || exit 1
+    echo "Run scripts/setup_linux.sh first to install the GUI in an isolated environment."
+    exit 1
 fi
 
-"$PYTHON" -m gui "$@"
+exec "$PYTHON" -m gui "$@"

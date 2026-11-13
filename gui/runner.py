@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import re
+import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -25,10 +29,6 @@ _WINDOW = re.compile(r"^\s*window (\d+)/(\d+)")
 # Stage 1 windows span this part of the bar; low-VRAM runs still have a
 # second pass to write the outputs after the last window.
 KEY_START, KEY_END, KEY_END_LOW_VRAM = 0.15, 0.97, 0.65
-
-# Scratch files run_inference deletes in its finally block; a killed run leaves them.
-_SCRATCH = ("_rvm_feat.f16", "_baton.f16", "_foundation_cradio.f32", "_foundation_moge.f32")
-
 
 def _clock(seconds: float) -> str:
     minutes, secs = divmod(int(seconds + 0.5), 60)
@@ -53,6 +53,7 @@ class QueueRunner(QObject):
         self._last_line = ""
         self._low_vram = False
         self._keying_since = 0.0
+        self._scratch: tempfile.TemporaryDirectory | None = None
 
     def is_running(self) -> bool:
         return self._proc is not None
@@ -76,7 +77,13 @@ class QueueRunner(QObject):
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         else:
-            self._proc.kill()
+            try:
+                if sys.platform.startswith("linux") and pid and os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    self._proc.kill()
+            except ProcessLookupError:
+                pass
         self._proc.waitForFinished(5000)
 
     def _start_next(self) -> None:
@@ -86,7 +93,17 @@ class QueueRunner(QObject):
             return
         self._clip = clip
         clip.output_dir = output_dir_for(clip, self._settings.output_parent)
-        args = infer_args(clip, self._settings, clip.output_dir)
+        # Each job owns its scratch files; stopping it must not delete files
+        # belonging to another UI or CLI run with the same clip name.
+        try:
+            Path(self._settings.temp_dir).mkdir(parents=True, exist_ok=True)
+            self._scratch = tempfile.TemporaryDirectory(prefix="gui-", dir=self._settings.temp_dir)
+        except OSError as exc:
+            self._set(clip, FAILED, 0.0, f"Cannot create temporary directory: {exc}")
+            self.finished.emit()
+            return
+        settings = replace(self._settings, temp_dir=self._scratch.name)
+        args = infer_args(clip, settings, clip.output_dir)
         self._buffer, self._last_line = "", ""
         self._low_vram = self._settings.low_vram and not self._settings.auto_vram
         self._keying_since = time.monotonic()
@@ -94,6 +111,8 @@ class QueueRunner(QObject):
         self.clip_started.emit(clip)
 
         proc = QProcess(self)
+        if sys.platform.startswith("linux"):
+            proc.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.setWorkingDirectory(str(ROOT))
         env = QProcessEnvironment.systemEnvironment()
@@ -158,6 +177,7 @@ class QueueRunner(QObject):
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         self._drain()
         proc, self._proc = self._proc, None
+        self._remove_scratch(self._clip)
         if proc is not None:
             proc.deleteLater()
         clip = self._clip
@@ -178,6 +198,7 @@ class QueueRunner(QObject):
         if error != QProcess.ProcessError.FailedToStart:
             return  # finished() follows every other error
         proc, self._proc = self._proc, None
+        self._remove_scratch(self._clip)
         message = proc.errorString() if proc is not None else ""
         if proc is not None:
             proc.deleteLater()
@@ -185,12 +206,12 @@ class QueueRunner(QObject):
         self._start_next()
 
     def _remove_scratch(self, clip: Clip) -> None:
-        temp = Path(self._settings.temp_dir)
-        for suffix in _SCRATCH:
+        if self._scratch is not None:
             try:
-                (temp / f"{clip.name}{suffix}").unlink(missing_ok=True)
+                self._scratch.cleanup()
             except OSError:
                 pass
+            self._scratch = None
 
     def _update(self, clip: Clip, progress: float, detail: str) -> None:
         self._set(clip, RUNNING, progress, detail)

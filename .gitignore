@@ -6,6 +6,9 @@ __pycache__/
 
 # Environments
 venv/
+.venv/
+build/
+.pytest_cache/
 .env
 
 # Large Assets and Pretrained Weights

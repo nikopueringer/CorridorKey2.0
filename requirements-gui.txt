@@ -1,0 +1,2 @@
+# Qt 6.7 adds Unix process-session support for reliable Linux cancellation.
+PySide6-Essentials>=6.7,<7

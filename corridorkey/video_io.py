@@ -397,8 +397,10 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
     if (not meta.get("exr_linear", False)
-            and not str(path).lower().endswith(".exr")):
-        # sRGB PNG/JPEG frames take the same table-lookup path as video.
+            and not str(path).lower().endswith(".exr")
+            and not has_linear_adjust(meta)):
+        # The original frame-directory float path does not apply these adjustments.
+        # Keep adjusted metadata on that path to preserve its existing behavior.
         frame_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if frame_bgr is None:
             raise FileNotFoundError(path)

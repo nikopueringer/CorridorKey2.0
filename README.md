@@ -16,6 +16,14 @@ Led by Ale Alvaro, we now have a plugin (and stand-alone app) available for almo
 Any business or research inquiries for Zac can be directed to z.brooks.harris@gmail.com
 
 
+## Community Linux desktop and Resolve OpenFX build (experimental)
+
+This branch continues the desktop GUI from PR #8 and adds a Linux x86-64
+OpenFX bridge for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
+The GUI retains temporal processing and hints; OFX currently keys individual
+frames through a separate local CUDA worker. This community build is separate
+from the official paid plugin.
+
 ## Setup
 
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,8 +75,10 @@ def raw_clip_name(path) -> str:
 
 def frame_files(folder: Path) -> list[Path]:
     try:
-        return sorted(p for p in Path(folder).iterdir()
-                      if p.is_file() and p.suffix.lower() in FRAME_EXTS)
+        return sorted((p for p in Path(folder).iterdir()
+                       if p.is_file() and p.suffix.lower() in FRAME_EXTS),
+                      key=lambda p: [int(t) if t.isdigit() else t
+                                     for t in re.split(r"(\d+)", p.name.lower())])
     except OSError:
         return []
 

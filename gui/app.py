@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -14,6 +15,11 @@ from .theme import app_icon, apply_theme
 
 
 def main() -> int:
+    # opencv-python exports its bundled Qt5 plugin path on Linux. PySide6 uses
+    # Qt6 and cannot load those plugins; preserve any non-OpenCV user override.
+    for key in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR"):
+        if "/cv2/" in os.environ.get(key, ""):
+            os.environ.pop(key)
     if sys.platform == "win32":
         # Own taskbar button and icon, rather than grouping under pythonw.exe.
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
