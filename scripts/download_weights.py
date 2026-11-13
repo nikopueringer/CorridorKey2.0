@@ -19,6 +19,7 @@ import argparse
 import base64
 import hashlib
 import shutil
+import ssl
 import urllib.request
 from pathlib import Path
 
@@ -67,6 +68,14 @@ def download_moge(root: Path) -> None:
     hf_hub_download(MOGE_REPO, "model.pt", revision=MOGE_REVISION, local_dir=root / "vfms/moge")
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """Return an SSL context, falling back to certifi if default CA paths are missing."""
+    if ssl.get_default_verify_paths().cafile is None:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
+
 def download_rvm(root: Path) -> None:
     dst = root / "vfms/rvm" / RVM_FILE
     if dst.is_file() and _md5_b64(dst) == RVM_MD5_B64:
@@ -75,7 +84,7 @@ def download_rvm(root: Path) -> None:
     print(f"[rvm] {RVM_URL}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    with urllib.request.urlopen(RVM_URL) as response, open(tmp, "wb") as f:
+    with urllib.request.urlopen(RVM_URL, context=_ssl_context()) as response, open(tmp, "wb") as f:
         shutil.copyfileobj(response, f, length=1 << 20)
     if _md5_b64(tmp) != RVM_MD5_B64:
         tmp.unlink()

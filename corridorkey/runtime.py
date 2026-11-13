@@ -187,10 +187,69 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
     return 1, 1, True, estimate
 
 
-def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # Memory this process already holds (the loaded model) is part of the budget.
-    budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
+def resolve_device(device: str | torch.device | None = None) -> str:
+    """Resolve 'auto' or an explicit device string ('cuda', 'mps', 'cpu')."""
+    if device in (None, "auto"):
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        raise RuntimeError(
+            "CorridorKey v2 runtime requires a CUDA or Apple Silicon MPS GPU "
+            "(or pass --device cpu)."
+        )
+    dev_str = str(device)
+    if dev_str.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is False.")
+    if dev_str.startswith("mps") and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        raise RuntimeError("MPS device requested, but torch.backends.mps.is_available() is False.")
+    return dev_str
+
+
+def _device_type(device: str | torch.device) -> str:
+    return device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+
+
+def _device_autocast(device: str | torch.device):
+    return torch.autocast(_device_type(device), dtype=torch.bfloat16)
+
+
+def _empty_device_cache(device: str | torch.device | None = None) -> None:
+    dev_type = _device_type(device) if device is not None else None
+    if (dev_type in (None, "cuda")) and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif (dev_type in (None, "mps")) and hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def _synchronize_device(device: str | torch.device | None = None) -> None:
+    dev_type = _device_type(device) if device is not None else None
+    if (dev_type in (None, "cuda")) and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif (dev_type in (None, "mps")) and hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
+def _model_device(model) -> torch.device:
+    dev = getattr(model, "runtime_device", None)
+    if dev is not None:
+        return torch.device(dev)
+    return torch.device(resolve_device("auto"))
+
+
+def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int,
+                    device: str | torch.device = "cuda") -> None:
+    dev_type = _device_type(device)
+    if dev_type == "cuda" and torch.cuda.is_available():
+        free_bytes, _ = torch.cuda.mem_get_info()
+        # Memory this process already holds (the loaded model) is part of the budget.
+        budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
+    elif dev_type == "mps" and hasattr(torch, "mps") and torch.backends.mps.is_available():
+        budget_gb = torch.mps.recommended_max_memory() / 2**30
+    else:
+        budget_gb = 8.0
     chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
@@ -235,7 +294,8 @@ def load_runtime_checkpoint(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
 
 
-def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
+def load_model(paths: RuntimePaths, device: str = "auto") -> CorridorKeyV3:
+    device = resolve_device(device)
     paths.validate()
     prepare_runtime_environment(paths)
     ckpt = load_runtime_checkpoint(paths.weights)
@@ -261,6 +321,7 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
             f"missing={train_missing[:8]} unexpected={train_unexpected[:8]}")
     print(f"  loaded weights; omitted frozen foundation tensors={len(missing)}")
     model.eval()
+    model.runtime_device = torch.device(device)
     del ckpt
     return model
 
@@ -285,7 +346,13 @@ def _build_foundation_inputs(rgb_bt: torch.Tensor):
     flat = rgb_bt.reshape(B * T, 3, H, W)
     rgb_radio = F.interpolate(flat, size=(H // 4, W // 4), mode="area")
     H_moge, W_moge = (H * 7) // 32, (W * 7) // 32
-    rgb_moge = F.interpolate(flat, size=(H_moge, W_moge), mode="area")
+    if flat.device.type == "mps" and (H % H_moge != 0 or W % W_moge != 0):
+        # MPS adaptive_avg_pool2d ("area") requires input dims divisible by output dims.
+        rgb_moge = F.interpolate(
+            flat.cpu(), size=(H_moge, W_moge), mode="area",
+        ).to(flat.device, non_blocking=True)
+    else:
+        rgb_moge = F.interpolate(flat, size=(H_moge, W_moge), mode="area")
     return (
         rgb_radio.reshape(B, T, 3, H // 4, W // 4),
         rgb_moge.reshape(B, T, 3, H_moge, W_moge),
@@ -334,14 +401,14 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
                 rgb.reshape(Tc, 3, H, W), size=(H_e, W_e),
                 mode="bilinear", align_corners=False,
             ).reshape(1, Tc, 3, H_e, W_e).clamp(0.0, 1.0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _device_autocast(device):
                 feats, state = model.foundations.rvm(rgb_rvm, state=state)
             feats_cpu = (feats.float().cpu() - mean) / std
             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
             del rgb, rgb_rvm, feats, feats_cpu, display
     out.flush()
     del out
-    torch.cuda.empty_cache()
+    _empty_device_cache(device)
 
 
 @torch.no_grad()
@@ -383,7 +450,7 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             Tc = display.shape[0]
             rgb = display.unsqueeze(0).to(device, non_blocking=True)
             rgb_radio, rgb_moge = _build_foundation_inputs(rgb)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _device_autocast(device):
                 ff = model.foundations(
                     rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                     rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -397,27 +464,29 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
     if cradio_out is not None:
         cradio_out.flush()
         del cradio_out
-    torch.cuda.empty_cache()
+    _empty_device_cache(device)
     return paths
 
 
 def _phase1_setup(model, *, stage1_on_gpu: bool = True):
-    model.foundations.cuda()
+    dev = _model_device(model)
+    model.foundations.to(dev)
     # Low-VRAM mode precomputes foundation features first, so stage 1 waits on CPU.
     if stage1_on_gpu:
-        model.stage1.cuda()
+        model.stage1.to(dev)
     else:
         model.stage1.cpu()
     model.stage2.cpu()
-    torch.cuda.empty_cache()
+    _empty_device_cache(dev)
 
 
 def _phase2_setup(model):
+    dev = _model_device(model)
     model.foundations.cpu()
     model.stage1.cpu()
-    torch.cuda.empty_cache()
-    model.stage2.cuda()
-    torch.cuda.synchronize()
+    _empty_device_cache(dev)
+    model.stage2.to(dev)
+    _synchronize_device(dev)
 
 
 @torch.no_grad()
@@ -512,7 +581,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             if foundation_paths is None:
                 rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=True)
                 rgb_radio, rgb_moge = _build_foundation_inputs(rgb_found)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with _device_autocast(device):
                     ff = model.foundations(
                         rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                         rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -528,7 +597,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             if rvm_map is not None:
                 rvm_feat = torch.from_numpy(np.asarray(rvm_map[t0:t1]).copy())
                 rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=True).float()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with _device_autocast(device):
                 s1 = model.stage1(
                     rgb_c, hint_c, moge_feat, cradio_feat=cradio_feat,
                     rvm_feat=rvm_feat, t_stride=1.0,
@@ -565,7 +634,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
             print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
-        torch.cuda.synchronize()
+        _synchronize_device(device)
         flush_before(T_all + 1)
     finally:
         reader.close()
@@ -575,7 +644,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
     if baton_fp16 is not None:
         baton_fp16.flush()
     del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map
-    torch.cuda.empty_cache()
+    _empty_device_cache(device)
 
 
 def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -760,10 +829,11 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
             linear_contrast_pivot=cfg.linear_contrast_pivot)
+    dev = _model_device(model)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
-        apply_auto_vram(cfg, (H, W), T_all)
+        apply_auto_vram(cfg, (H, W), T_all, device=dev)
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
@@ -865,12 +935,12 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader_kind=reader_kind)
             model.foundations.cpu()
             model.stage2.cpu()
-            model.stage1.cuda()
-            torch.cuda.empty_cache()
+            model.stage1.to(dev)
+            _empty_device_cache(dev)
         else:
-            model.stage2.cuda()
+            model.stage2.to(dev)
             model.stage2.eval()
-            torch.cuda.empty_cache()
+            _empty_device_cache(dev)
 
         stage2_batch = max(1, int(cfg.stage2_batch))
 
@@ -883,7 +953,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 baton_np = np.stack([item[1] for item in sub], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
                 baton_t = baton_t.to(device, non_blocking=True).float()
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.inference_mode(), _device_autocast(device):
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
@@ -932,6 +1002,6 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
-        torch.cuda.empty_cache()
+        _empty_device_cache(dev)
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
