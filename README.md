@@ -762,6 +762,17 @@ The full terms are in [LICENSE](LICENSE). The license is a variation of
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) with
 additional terms.
 
+## Contributing
+
+Install the project and its dev dependencies, then run the test suite before and after your changes:
+
+```sh
+uv sync --extra dev
+uv run python -m pytest tests/ -v
+```
+
+The tests cover auto-VRAM selection, frame path ordering, MPS attention, RMSNorm dtype preservation, and window batching. They run on CPU, MPS, or CUDA depending on what is available. CUDA-only tests are skipped automatically on macOS. All tests should pass (some skip on hardware that is not present) before a PR is submitted.
+
 ## Acknowledgements
 
 CorridorKey builds on three foundation models. Please go show their creators

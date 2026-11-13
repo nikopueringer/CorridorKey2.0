@@ -25,6 +25,9 @@ dependencies = [
     "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
