@@ -355,6 +355,186 @@ def test_queued_old_load_and_failure_are_discarded_after_new_request(app, monkey
         app.processEvents()
 
 
+def test_same_generation_loaded_snapshot_cannot_restore_stale_frame_count(app, tmp_path):
+    path = tmp_path / "same-generation.mov"
+    path.touch()
+    loader = FrameLoader()
+    loader.request = lambda *_args, **_kwargs: None  # install UI state without a decoder request
+    viewer = ViewerPanel(loader)
+    image = QImage(64, 48, QImage.Format.Format_RGB888)
+    try:
+        viewer.set_clip(Clip(path, path, False), {})
+        generation = 7
+        with loader._cond:
+            loader._generation = generation
+            loader._latest_request = (str(path), 0, True, False, 24.0, False,
+                                     "legacy", True, "auto", generation)
+        # Replay loaded snapshots queued within the same generation. Both an
+        # undercount and an overcount must defer to the authoritative scan.
+        for stale_count in (192, 196):
+            loader._count_for_generation.emit(generation, str(path), 194)
+            loader._loaded_for_generation.emit(generation, str(path), 0, stale_count,
+                                               25.0, image)
+            app.processEvents()
+            assert viewer._count == 194
+            assert viewer.slider.maximum() == 193
+            assert "194 frames" in viewer.metadata_label.text()
+    finally:
+        viewer.close()
+        loader.shutdown()
+        app.processEvents()
+
+
+def test_interrupted_source_reopen_keeps_known_exact_frame_count(app, monkeypatch, tmp_path):
+    path = make_edit_list_video(tmp_path)
+    original = frames.FrameSource(path)
+    reopened = None
+    release_scan = threading.Event()
+    try:
+        assert original._count_scan_finished.wait(5.0)
+        assert original.exact_count == 10
+        original.interrupt()
+        original.close()
+
+        # Hold the new scan so this assertion can only pass from the identity-
+        # keyed cache seeded by the first successful scan.
+        entered_scan = threading.Event()
+
+        def held_scan(_source):
+            entered_scan.set()
+            release_scan.wait(3.0)
+
+        monkeypatch.setattr(frames.FrameSource, "_count_video_frames", held_scan)
+        reopened = frames.FrameSource(path)
+        assert not entered_scan.is_set()  # exact count is seeded synchronously
+        assert reopened.count == 10
+        assert reopened.exact_count == 10
+    finally:
+        release_scan.set()
+        if reopened is not None:
+            reopened.close()
+        original.close()
+
+
+def test_exact_count_cache_invalidates_when_file_identity_changes(monkeypatch, tmp_path):
+    path = make_edit_list_video(tmp_path)
+    capture = frames.cv2.VideoCapture(str(path))
+    metadata_count = int(capture.get(frames.cv2.CAP_PROP_FRAME_COUNT))
+    capture.release()
+    first = frames.FrameSource(path)
+    try:
+        assert first._count_scan_finished.wait(5.0)
+        assert first.exact_count == 10
+        old_identity = frames._video_identity(path)
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+        new_identity = frames._video_identity(path)
+        assert new_identity != old_identity
+
+        entered_scan = threading.Event()
+        release_scan = threading.Event()
+
+        def held_scan(_source):
+            entered_scan.set()
+            release_scan.wait(3.0)
+
+        monkeypatch.setattr(frames.FrameSource, "_count_video_frames", held_scan)
+        changed = frames.FrameSource(path)
+        try:
+            assert entered_scan.wait(1.0)
+            assert changed.count == metadata_count
+            assert changed.exact_count is None
+            assert frames._cached_exact_count(new_identity) is None
+        finally:
+            release_scan.set()
+            changed.close()
+    finally:
+        first.close()
+
+
+def test_count_scan_result_is_discarded_if_file_changes_mid_scan(monkeypatch, tmp_path):
+    path = make_edit_list_video(tmp_path)
+    old_identity = frames._video_identity(path)
+    scan_started = threading.Event()
+    finish_scan = threading.Event()
+
+    class FakePopen:
+        def __init__(self, *_args, **_kwargs):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            scan_started.set()
+            if not finish_scan.wait(3.0):
+                raise subprocess.TimeoutExpired("fake ffmpeg", timeout)
+            self.returncode = 0
+            return "frame=10\nprogress=end\n", ""
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            finish_scan.set()
+
+        def kill(self):
+            self.returncode = -9
+            finish_scan.set()
+
+    monkeypatch.setattr(frames.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(frames, "validate_video", lambda _path: None)
+    source = frames.FrameSource(path)
+    metadata_count = source.count
+    try:
+        assert scan_started.wait(1.0)
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+        new_identity = frames._video_identity(path)
+        assert new_identity != old_identity
+        finish_scan.set()
+        assert source._count_scan_finished.wait(1.0)
+        assert source.exact_count is None
+        assert source.count == metadata_count
+        assert frames._cached_exact_count(new_identity) is None
+    finally:
+        finish_scan.set()
+        source.close()
+
+
+def test_exact_count_cache_overrides_underreported_container_metadata(monkeypatch, tmp_path):
+    path = tmp_path / "cached-count.mov"
+    path.write_bytes(b"synthetic media identity")
+    frames._remember_exact_count(frames._video_identity(path), 10)
+
+    class FakeCapture:
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            values = {
+                frames.cv2.CAP_PROP_FRAME_COUNT: 8,
+                frames.cv2.CAP_PROP_FPS: 25,
+                frames.cv2.CAP_PROP_FRAME_WIDTH: 64,
+                frames.cv2.CAP_PROP_FRAME_HEIGHT: 48,
+            }
+            return values[prop]
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(frames, "validate_video", lambda _path: None)
+    monkeypatch.setattr(frames.cv2, "VideoCapture", lambda _path: FakeCapture())
+    monkeypatch.setattr(frames.shutil, "which", lambda _name: None)
+    source = frames.FrameSource(path)
+    try:
+        assert source.count == 10
+        assert source.exact_count == 10
+    finally:
+        source.close()
+
+
 def test_playback_timer_uses_first_loaded_video_fps(app, tmp_path):
     class StubLoader(QObject):
         loaded = Signal(str, int, int, float, object)

@@ -22,6 +22,35 @@ from corridorkey.camera_video import CameraVideoReader, read_frame_dir_codes
 
 _MAX_OPEN = 6
 _CUTOUT_CACHE_BYTES = 32 * 1024 * 1024
+_EXACT_COUNTS: OrderedDict[tuple, int] = OrderedDict()
+_EXACT_COUNTS_LOCK = threading.Lock()
+
+
+def _video_identity(path: Path) -> tuple | None:
+    try:
+        path = path.resolve()
+        stat = path.stat()
+        return str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
+
+
+def _cached_exact_count(identity: tuple | None) -> int | None:
+    with _EXACT_COUNTS_LOCK:
+        count = _EXACT_COUNTS.get(identity)
+        if count is not None:
+            _EXACT_COUNTS.move_to_end(identity)
+        return count
+
+
+def _remember_exact_count(identity: tuple | None, count: int) -> None:
+    if identity is None or count <= 0:
+        return
+    with _EXACT_COUNTS_LOCK:
+        _EXACT_COUNTS[identity] = count
+        _EXACT_COUNTS.move_to_end(identity)
+        while len(_EXACT_COUNTS) > 128:
+            _EXACT_COUNTS.popitem(last=False)
 
 
 def _srgb_encode(x: np.ndarray) -> np.ndarray:
@@ -159,8 +188,10 @@ class FrameSource:
         self._count_cancel = threading.Event()
         self._count_thread: threading.Thread | None = None
         self._count_scan_finished = threading.Event()
+        self._identity = None
         if self.files is None:
             validate_video(self.path)
+            self._identity = _video_identity(self.path)
             self.cap = cv2.VideoCapture(str(self.path))
             if not self.cap.isOpened():
                 raise OSError(f"Cannot open {self.path.name}")
@@ -170,7 +201,11 @@ class FrameSource:
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             # CAP_PROP_FRAME_COUNT can include samples hidden by MP4 edit lists.
             # Count in the background so the first preview frame is still fast.
-            if self.path.is_file() and shutil.which("ffmpeg"):
+            cached_count = _cached_exact_count(self._identity)
+            if cached_count is not None:
+                self.exact_count = self.count = cached_count
+                self._count_scan_finished.set()
+            elif self.path.is_file() and shutil.which("ffmpeg"):
                 self._count_thread = threading.Thread(
                     target=self._count_video_frames, name="preview-frame-count", daemon=True)
                 self._count_thread.start()
@@ -235,6 +270,9 @@ class FrameSource:
             count = int(progress["frame"].strip())
             if progress.get("progress") != "end" or count <= 0:
                 return
+            if self._identity != _video_identity(self.path):
+                return  # A result from a replaced file cannot describe its successor.
+            _remember_exact_count(self._identity, count)
             with self._count_lock:
                 self.exact_count = self.count = count
         except (OSError, KeyError, ValueError, subprocess.SubprocessError):
@@ -450,6 +488,8 @@ class FrameLoader(QObject):
         super().__init__(parent)
         self._cond = threading.Condition()
         self._request: tuple[str, int, bool, bool, float, bool, str, bool, str, int] | None = None
+        self._latest_request: tuple | None = None
+        self._delivered_exact_count: tuple[int, str, int] | None = None
         self._release = False
         self._alive = True
         self._sources: dict[str, FrameSource] = {}
@@ -475,6 +515,7 @@ class FrameLoader(QObject):
             self._request = (str(path), index, linear_float, cutout,
                              sequence_fps, cutout_linear, profile_id,
                              display_transform, input_range, generation)
+            self._latest_request = self._request
             self._pending_count_failures.clear()
             self._interrupt_active_before(generation)
             self._cond.notify()
@@ -540,10 +581,12 @@ class FrameLoader(QObject):
             if self._is_stale(generation):
                 return
             source = self._sources.get(path)
+            identity = getattr(source, "_identity", None)
             if (source is not None and (source.linear_float != linear_float or
                     source.cutout != cutout or source.cutout_linear != cutout_linear or
                     source._interrupted.is_set() or source.profile_id != profile_id or
-                    source.display_transform != display_transform or source.input_range != input_range)):
+                    source.display_transform != display_transform or source.input_range != input_range or
+                    (identity is not None and identity != _video_identity(Path(path))))):
                 self._sources.pop(path, None)
                 self._safe_close(source)
                 source = None
@@ -632,6 +675,18 @@ class FrameLoader(QObject):
     def _deliver_loaded(self, generation: int, path: str, index: int, count: int,
                         fps: float, image: QImage) -> None:
         if not self._is_stale(generation):
+            exact = self._delivered_exact_count
+            if exact is not None and exact[:2] == (generation, path):
+                count = exact[2]
+                if index >= count:
+                    # Do not relabel a previously decoded image as another frame.
+                    # Request the actual last frame using this generation's settings.
+                    with self._cond:
+                        request = self._latest_request
+                        if request is not None and request[-1] == generation:
+                            self._queue_count_resolution(request[:1] + (index,) + request[2:],
+                                                         "Frame exceeds corrected count", count)
+                    return
             self.loaded.emit(path, index, count, fps, image)
 
     def _deliver_failed(self, generation: int, path: str, message: str) -> None:
@@ -640,6 +695,7 @@ class FrameLoader(QObject):
 
     def _deliver_count(self, generation: int, path: str, count: int) -> None:
         if not self._is_stale(generation):
+            self._delivered_exact_count = generation, path, count
             self.count_corrected.emit(path, count)
 
     def _is_stale(self, generation: int) -> bool:

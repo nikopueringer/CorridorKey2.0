@@ -22,8 +22,8 @@ This branch continues the desktop GUI from PR #8 and adds Linux x86-64 and Apple
 OpenFX bridges for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
 The GUI retains temporal processing and hints; OFX currently keys individual
 frames through a separate local CUDA or MPS worker. This community build is separate
-from the official paid plugin. An Apple Silicon desktop app with bundled Python
-and the reviewed MPS backend is also available: [Mac build and usage](packaging/macos/README.md).
+from the official paid plugin. Apple Silicon packaging includes bundled Python
+and an MPS backend: [Mac build, validation status and usage](packaging/macos/README.md).
 See the [review of all upstream pull requests](docs/PR_REVIEW.md) for integration decisions.
 
 The desktop queue shows live elapsed processing time and phase-specific estimates
