@@ -14,8 +14,10 @@ concurrency:
 
 jobs:
   macos-app:
-    name: Apple Silicon app
-    runs-on: macos-15
+    name: Apple Silicon app and OFX
+    # The macos-15 arm64 pool repeatedly failed to allocate a runner. Build on
+    # the current standard arm64 image while retaining the macOS 15 target.
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
