@@ -16,6 +16,12 @@ The existing signed-asinh model encoding preserves negative values and HDR
 highlights. Only foundation-model proxies and display previews are limited to
 SDR sRGB. No sampled camera LUT is used.
 
+Before rendering camera-profile video or original-RGB outputs, a decode-only
+pass counts the frames FFmpeg actually returns. MP4 edit lists can make the
+container's sample count larger than the playable frame count. The decoded
+count determines processing ranges and buffers; reported FPS is unchanged.
+Decoder errors still stop processing instead of silently truncating a render.
+
 **Input range** controls the video decoder's transport levels. Auto follows
 container metadata; Full and Legal override that interpretation for incorrectly
 labelled sources. It does not apply a second legal-range expansion after the

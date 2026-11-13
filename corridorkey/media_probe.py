@@ -81,3 +81,56 @@ def probe_video(path: str | Path, ffprobe_bin: str = "ffprobe") -> VideoInfo:
 def validate_video(path: str | Path, ffprobe_bin: str = "ffprobe") -> VideoInfo:
     """Reject known unsupported variable-ACT streams with a conversion hint."""
     return probe_video(path, ffprobe_bin)
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+@lru_cache(maxsize=128)
+def _count_decoded_cached(path_text: str, identity: tuple[int, int, int, int],
+                          ffmpeg: str, executable_identity: tuple[int, int, int, int]) -> int:
+    del executable_identity  # invalidates the cache after decoder replacement
+    path = Path(path_text)
+    print(f"  Counting decodable frames: {path.name}", flush=True)
+    # Container sample counts can include frames hidden by MP4 edit lists.
+    # Match CameraVideoReader's stream selection and timestamp passthrough,
+    # without expensive RGB conversion or writing decoded pixels to disk.
+    result = subprocess.run(
+        [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+         "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+         "-fps_mode", "passthrough", "-nostats", "-progress", "pipe:1",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    if _act_error(result.stderr):
+        raise _act_help(path, result.stderr)
+    if result.returncode or result.stderr.strip():
+        raise ValueError(f"FFmpeg could not count decoded frames for {path.name}: "
+                         f"{result.stderr.strip() or 'exit status ' + str(result.returncode)}")
+    progress = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    try:
+        count = int(progress["frame"].strip())
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"FFmpeg returned no decoded frame count for {path.name}") from exc
+    if progress.get("progress") != "end" or count <= 0:
+        raise ValueError(f"FFmpeg did not finish counting video frames for {path.name}")
+    if _file_identity(path) != identity:
+        raise ValueError(f"Input changed while counting frames: {path.name}; retry after the file is stable")
+    return count
+
+
+def count_decoded_video_frames(path: str | Path, ffmpeg_bin: str = "ffmpeg") -> int:
+    """Count actual FFmpeg output frames, caching only successful stable scans.
+
+    This full decode is for the render preflight, not interactive preview.
+    The queue's process-group cancellation also stops this decoder subprocess.
+    """
+    video = Path(path).expanduser().resolve()
+    executable = shutil.which(ffmpeg_bin)
+    if executable is None:
+        raise FileNotFoundError(f"ffmpeg binary not found: {ffmpeg_bin}")
+    decoder = Path(executable).resolve()
+    return _count_decoded_cached(str(video), _file_identity(video),
+                                 str(decoder), _file_identity(decoder))

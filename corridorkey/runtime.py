@@ -896,6 +896,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   "display-coded and clipped to [0, 1]. For scene-linear HDR "
                   "EXR plates, pass --frame_dir_linear.")
     else:
+        decoded_frame_count = None
+        if cfg.input_color_space != "legacy" or cfg.color_output == "source_rgb":
+            from .media_probe import count_decoded_video_frames
+            decoded_frame_count = count_decoded_video_frames(input_path, writer_cfg.ffmpeg_bin)
         meta = probe_video_meta(
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, native_resolution=True,
@@ -903,7 +907,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             model_scale=cfg.model_scale,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
-            linear_contrast_pivot=cfg.linear_contrast_pivot)
+            linear_contrast_pivot=cfg.linear_contrast_pivot,
+            decoded_frame_count=decoded_frame_count)
     if cfg.input_range not in ("auto", "full", "legal"):
         raise ValueError(f"unsupported input range {cfg.input_range!r}")
     if cfg.color_output not in ("processed_working", "processed_source", "source_rgb"):

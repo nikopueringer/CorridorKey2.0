@@ -20,7 +20,7 @@ from corridorkey.runtime import (
     run_inference,
 )
 from corridorkey.video_io import require_ffmpeg
-from corridorkey.media_probe import validate_video
+from corridorkey.media_probe import validate_video, count_decoded_video_frames
 from corridorkey.device import configure_auto_memory, select_device
 
 
@@ -132,6 +132,10 @@ def main():
     require_ffmpeg(args.ffmpeg_bin)
     if not Path(args.input).is_dir():
         validate_video(args.input)
+        if args.input_color_space != "legacy" or args.color_output == "source_rgb":
+            # Validate the actual decode before allocating GPU/model memory.
+            # run_inference reuses this cached count when calculating ranges.
+            count_decoded_video_frames(args.input, args.ffmpeg_bin)
     device = select_device()
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)

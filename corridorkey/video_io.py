@@ -202,7 +202,8 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      native_resolution: bool, start_mode: str, seed: int,
                      model_scale: float, linear_brightness: float,
                      linear_contrast: float,
-                     linear_contrast_pivot: float) -> dict:
+                     linear_contrast_pivot: float,
+                     decoded_frame_count: int | None = None) -> dict:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -211,6 +212,13 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+    if decoded_frame_count is not None:
+        if decoded_frame_count <= 0:
+            raise ValueError("decoded frame count must be positive")
+        if n_total != decoded_frame_count:
+            print(f"  Frame count corrected: container reports {n_total}, "
+                  f"decoder outputs {decoded_frame_count}")
+        n_total = int(decoded_frame_count)
 
     q = int(shape_quantum)
     if native_resolution:
