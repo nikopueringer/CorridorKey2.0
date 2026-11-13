@@ -83,8 +83,11 @@ def test_auto_mps_profile_bounds_4k_batches(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_auto_cuda_profile_keeps_original_batches(monkeypatch):
     from corridorkey.runtime import InferenceConfig, apply_auto_vram
-    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda dev: (12 * 2**30, 16 * 2**30))
-    monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda dev: 2 * 2**30)
+    import corridorkey.runtime as _rt
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda *args: (12 * 2**30, 16 * 2**30))
+    monkeypatch.setattr(torch.cuda, 'memory_reserved', lambda *args: 2 * 2**30)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: None)
+    monkeypatch.setattr(_rt.time, 'sleep', lambda _: None)
     cfg = InferenceConfig(auto_vram=True)
     apply_auto_vram(cfg, (2176, 3840), 302, 'cuda')
     assert (cfg.hann_chunk, cfg.hann_stride, cfg.low_vram) == (8, 4, True)
