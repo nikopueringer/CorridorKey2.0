@@ -1,7 +1,9 @@
 """Polls nvidia-smi so the run bar can show how much GPU memory is free."""
 from __future__ import annotations
 
+import platform
 import shutil
+import sys
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
@@ -14,9 +16,16 @@ class GpuMonitor(QObject):
         self._proc: QProcess | None = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
-        if shutil.which("nvidia-smi"):
+        if not self.status_text() and shutil.which("nvidia-smi"):
             self._timer.start(interval_ms)
             QTimer.singleShot(0, self._poll)
+
+    @staticmethod
+    def status_text() -> str:
+        """A truthful static label for Apple Silicon, which has no nvidia-smi telemetry."""
+        if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+            return "Apple Silicon · MPS"
+        return ""
 
     def shutdown(self) -> None:
         self._timer.stop()

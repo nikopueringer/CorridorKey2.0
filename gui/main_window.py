@@ -51,7 +51,13 @@ CLIP_FILTER = (f"Clips ({' '.join('*' + ext for ext in sorted(VIDEO_EXTS))});;"
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CorridorKey 2.0 · Community Linux build" if sys.platform.startswith("linux") else "CorridorKey 2.0")
+        if sys.platform.startswith("linux"):
+            title = "CorridorKey 2.0 · Community Linux build"
+        elif sys.platform == "darwin":
+            title = "CorridorKey 2.0 · Community Mac build"
+        else:
+            title = "CorridorKey 2.0"
+        self.setWindowTitle(title)
         self.resize(1480, 900)
         self.setAcceptDrops(True)
         self._counts: Counter[str] = Counter()
@@ -159,6 +165,7 @@ class MainWindow(QMainWindow):
         self.status.setObjectName("muted")
         self.gpu_label = QLabel()
         self.gpu_label.setObjectName("subtle")
+        self.gpu_label.setText(self.gpu.status_text())
         self.log_toggle = QToolButton()
         self.log_toggle.setText("Log")
         self.log_toggle.setCheckable(True)

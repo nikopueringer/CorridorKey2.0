@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .venv/
 build/
+dist/
 .pytest_cache/
 .env
 

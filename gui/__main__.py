@@ -9,6 +9,10 @@ on start. The UI needs PySide6 on top of requirements.txt:
 """
 import sys
 
+if sys.argv[1:] == ["--bundle-self-test"]:
+    from .bundle_selftest import main
+    sys.exit(main())
+
 try:
     from .app import main
 except ModuleNotFoundError as exc:

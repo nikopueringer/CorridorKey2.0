@@ -1,4 +1,7 @@
 import torch
+import pytest
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast regression")
 
 from corridorkey.blocks import LayerNorm2d, RMSNorm
 

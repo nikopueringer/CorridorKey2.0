@@ -5,12 +5,14 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QCoreApplication
 
 from gui import runner
 from gui import resolve_engine
+from gui import gpu
 from gui.clips import Clip, DONE, FAILED, STOPPED
 from gui.command import JobSettings
 
@@ -37,6 +39,11 @@ def linux_only():
         pytest.skip("Linux QProcess lifecycle behavior")
 
 
+def unix_only():
+    if not sys.platform.startswith(("linux", "darwin")):
+        pytest.skip("Unix QProcess process-group behavior")
+
+
 def setup_stub(monkeypatch, tmp_path, body):
     script = tmp_path / "stub_infer.py"
     script.write_text(body)
@@ -52,7 +59,6 @@ def setup_stub(monkeypatch, tmp_path, body):
 def test_queue_jobs_get_private_scratch_cleaned_on_success_and_failure(
     app, monkeypatch, tmp_path
 ):
-    linux_only()
     setup_stub(
         monkeypatch,
         tmp_path,
@@ -90,8 +96,12 @@ if record.stem == 'bad':
     assert clips[1].detail == "intentional failure"
 
 
-def test_stop_kills_process_group_child_and_cleans_only_job_scratch(app, monkeypatch, tmp_path):
-    linux_only()
+@pytest.mark.parametrize("platform_name", ["linux", "darwin"])
+def test_stop_kills_process_group_child_and_cleans_only_job_scratch(
+    app, monkeypatch, tmp_path, platform_name
+):
+    unix_only()
+    monkeypatch.setattr(runner, "sys", SimpleNamespace(platform=platform_name))
     setup_stub(
         monkeypatch,
         tmp_path,
@@ -141,3 +151,9 @@ def test_resolve_engine_clears_failed_to_start_process(app, monkeypatch):
 
     assert states[0] == "Loading Resolve engine…"
     assert states[-1] == "Resolve engine exited; see log"
+
+
+def test_apple_silicon_gpu_label_has_no_fabricated_memory_telemetry(monkeypatch):
+    monkeypatch.setattr(gpu.sys, "platform", "darwin")
+    monkeypatch.setattr(gpu.platform, "machine", lambda: "arm64")
+    assert gpu.GpuMonitor.status_text() == "Apple Silicon · MPS"

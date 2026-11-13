@@ -78,7 +78,7 @@ class QueueRunner(QObject):
                            creationflags=subprocess.CREATE_NO_WINDOW)
         else:
             try:
-                if sys.platform.startswith("linux") and pid and os.getpgid(pid) == pid:
+                if sys.platform.startswith(("linux", "darwin")) and pid and os.getpgid(pid) == pid:
                     os.killpg(pid, signal.SIGKILL)
                 else:
                     self._proc.kill()
@@ -111,7 +111,7 @@ class QueueRunner(QObject):
         self.clip_started.emit(clip)
 
         proc = QProcess(self)
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith(("linux", "darwin")):
             proc.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.setWorkingDirectory(str(ROOT))

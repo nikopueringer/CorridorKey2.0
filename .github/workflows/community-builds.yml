@@ -1,0 +1,74 @@
+name: Community desktop builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/linux-resolve-ofx]
+
+permissions:
+  contents: read
+
+jobs:
+  macos-app:
+    name: Apple Silicon app
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - name: Build native app with bundled Python
+        run: ./scripts/build_macos.sh
+      - name: Verify the archived app after relocation
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/Relocation Test"
+          ditto -x -k dist/CorridorKey-macOS-arm64.zip "$RUNNER_TEMP/Relocation Test"
+          APP="$RUNNER_TEMP/Relocation Test/CorridorKey.app"
+          rm -rf dist/CorridorKey.app
+          codesign --verify --deep --strict "$APP"
+          QT_QPA_PLATFORM=offscreen "$APP/Contents/MacOS/CorridorKey" --bundle-self-test
+          PY="$APP/Contents/Resources/Python/bin/python3"
+          SRC="$APP/Contents/Resources/src"
+          "$PY" "$SRC/infer.py" --help
+          uv pip install --python "$PY" --target "$RUNNER_TEMP/test-tools" pytest
+          cd "$SRC"
+          PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
+            tests/test_device.py tests/test_window_batching.py tests/test_mps_attention.py \
+            tests/test_frame_paths.py tests/test_preprocess_lut.py tests/test_asset_paths.py tests/test_linux_gui.py
+      - name: Upload Apple Silicon build
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKey-macOS-arm64
+          path: dist/CorridorKey-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-launcher-log
+          path: ~/Library/Logs/CorridorKey2.0/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux-ofx:
+    name: Linux OFX bundle
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch OpenFX headers
+        run: git clone --depth 1 --branch OFX_Release_1_4_TAG https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+      - name: Build and exercise host boundary
+        run: |
+          cmake -S ofx -B build/ofx -DCMAKE_BUILD_TYPE=Release -DOFX_INCLUDE_DIR="$RUNNER_TEMP/openfx/include"
+          cmake --build build/ofx --parallel 2
+          ctest --test-dir build/ofx --output-on-failure
+          mkdir -p dist
+          tar -czf dist/CorridorKeyLinux-ofx-x86_64.tar.gz -C build/ofx CorridorKeyLinux.ofx.bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKeyLinux-ofx-x86_64
+          path: dist/CorridorKeyLinux-ofx-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30

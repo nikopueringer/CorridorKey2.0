@@ -72,9 +72,10 @@ class RuntimePaths:
     @classmethod
     def from_package(cls, package_root: str | os.PathLike,
                      weights: str | os.PathLike | None = None):
-        root = Path(package_root).resolve()
+        # Packaged apps keep model downloads outside the application bundle.
+        root = Path(os.environ.get("CORRIDORKEY_ASSET_ROOT") or package_root).expanduser().resolve()
         return cls(
-            package_root=root,
+            package_root=Path(package_root).resolve(),
             weights=cls._resolve_user_or_package_path(
                 root, weights, cls._prefer_safetensors(root, "weights/corridorkey_v2")),
             foundation_stats=(
@@ -296,10 +297,13 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
     print(f"  loaded weights; omitted frozen foundation tensors={len(missing)}")
     model.eval()
     model.requires_grad_(False)
-    for module in model.modules():
-        if isinstance(module, _BF16_WEIGHT_MODULES):
-            for p in module.parameters(recurse=False):
-                p.data = p.data.to(torch.bfloat16)
+    # PR #9's storage optimization was validated on CUDA. Preserve PR #15's
+    # original storage policy on Metal until same-device parity is established.
+    if torch.device(device).type == "cuda":
+        for module in model.modules():
+            if isinstance(module, _BF16_WEIGHT_MODULES):
+                for p in module.parameters(recurse=False):
+                    p.data = p.data.to(torch.bfloat16)
     del ckpt
     return model
 

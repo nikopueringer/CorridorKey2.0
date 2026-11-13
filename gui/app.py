@@ -28,6 +28,10 @@ def main() -> int:
     app.setApplicationName("CorridorKey 2.0")
     app.setWindowIcon(app_icon())
     apply_theme(app)
+    if os.environ.get("CORRIDORKEY_BUNDLED_APP") == "1":
+        from .macos_setup import prepare
+        if not prepare():
+            return 0
     window = MainWindow()
     # pythonw.exe has no console, so stray exceptions go to the log panel instead.
     sys.excepthook = lambda *exc: window.report_error("".join(traceback.format_exception(*exc)))

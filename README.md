@@ -16,13 +16,15 @@ Led by Ale Alvaro, we now have a plugin (and stand-alone app) available for almo
 Any business or research inquiries for Zac can be directed to z.brooks.harris@gmail.com
 
 
-## Community Linux desktop and Resolve OpenFX build (experimental)
+## Community desktop builds and Linux Resolve OpenFX (experimental)
 
 This branch continues the desktop GUI from PR #8 and adds a Linux x86-64
 OpenFX bridge for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
 The GUI retains temporal processing and hints; OFX currently keys individual
 frames through a separate local CUDA worker. This community build is separate
-from the official paid plugin.
+from the official paid plugin. An Apple Silicon desktop app with bundled Python
+and the reviewed MPS backend is also available: [Mac build and usage](packaging/macos/README.md).
+See the [review of all upstream pull requests](docs/PR_REVIEW.md) for integration decisions.
 
 ## Setup
 
@@ -139,8 +141,7 @@ every output, and the settings described below as controls. It runs the same
 - **Linux:** `gui/CorridorKey.sh`
 - **Any platform:** `python -m gui [clip_or_folder ...]` from the repository root
 
-The launchers install PySide6, the UI toolkit, into the venv the first time
-they run; otherwise `pip install PySide6-Essentials`. To add a Start Menu entry
+Install the GUI toolkit with `pip install -r requirements-gui.txt` (the Windows launcher can also install it on first run). To add a Start Menu entry
 and a desktop shortcut with the CorridorKey icon (an applications-menu entry on
 Linux), run this once:
 
