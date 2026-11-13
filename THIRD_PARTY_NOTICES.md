@@ -1,5 +1,16 @@
 # Third-Party Notices
 
+## Optional native MPS attention
+
+`corridorkey/native/mps_attention.mm` adapts the unmasked MPSGraph attention
+wrapper from [Jason Hurt's attention-mps-torch](https://github.com/jhurt/attention-mps-torch),
+revision `d39628f3f292acdf8db8df68807031d56cf6b0ca` (Copyright 2026 Jason Hurt,
+Apache License 2.0). The full license is in `corridorkey/native/LICENSE`.
+Changes include ARC-safe buffer access, validation of contiguous zero-offset
+buffers, compiled-graph feed ordering, an inference-only unmasked interface,
+and omission of the optional FP16-intermediate graph rewrite. This component
+contains no model weights and does not alter the model-asset licenses.
+
 CorridorKey v2 is licensed under the Corridor Key Licence (see `LICENSE`).
 It depends on the third-party components below, which are not owned by
 Corridor Digital LLC and remain under their own licenses.

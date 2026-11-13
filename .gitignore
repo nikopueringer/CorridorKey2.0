@@ -6,6 +6,8 @@ __pycache__/
 
 # Environments
 venv/
+.venv/
+.pytest_cache/
 .env
 
 # Large Assets and Pretrained Weights
@@ -37,3 +39,4 @@ tmp/
 # Local / studio-specific files
 path_mappings.json
 .claude/
+corridorkey/native/build/

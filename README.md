@@ -1,4 +1,64 @@
+# CorridorKey 2.0 PLUS
+
+## Carrying the torch...
+
+At the time of this writing one full month since its original release, [nikopueringer/CorridorKey2.0](https://github.com/nikopueringer/CorridorKey2.0) has merged only 1 PR, and that PR contained only a name credit correction one day after the project was released. Several potentially useful PRs have accumulated in the mean time that have not merged yet, and I wanted to cherry-pick the best parts I've seen into a single _working_ branch.
+
+I have much love for Niko and the Corridor Crew, without whom none of this would be possible! :heart: But I know that maintaining an open source project can be, well, a whole second job, and they need to focus on making amazing VFX and sharing all the fun behind-the-scenes stories. That's why I'm just going to roll a bunch of updates into my own fork. Maybe some day this fork won't be necessary, but until then...
+
+I have both Apple Silicon based Macs (MPS) **_and_** Linux PCs with Nvidia GPUs (CUDA, etc) in my environment, and I want the best performance and reliability out of both. So, this fork's `plus` branch contains a selection of cherry-picked commits from several PRs against the original repo _plus_ many additional fixes to resolve conflicts, gate architecture-specific functionality (e.g. no CUDA on Macs), and generally smooth over some rough edges. Full author credit is retained in each of the commits I cherry-picked.
+
+Notable PRs that I've picked include:
+
+- [#15: Add Apple Silicon inference with bounded memory use](https://github.com/nikopueringer/CorridorKey2.0/pull/15) by **[jslinker](https://github.com/jslinker)**
+  - The foundation of this fork's macOS support: MPS device selection, Metal memory controls, and native 4K validation. Extended with an MPS budget fix (`_MPS_ESTIMATE_SCALE`) to prevent OOM when the auto-VRAM picker over-estimates available memory, and a frame-count probe fix (`_probe_frame_count` via ffprobe) for MP4s whose container metadata disagrees with the actual encoded duration.
+- [#20: Preprocess 8-bit frames ~17× faster with a lookup table](https://github.com/nikopueringer/CorridorKey2.0/pull/20) by **[MrFruitDude](https://github.com/MrFruitDude)**
+  - Builds a 256-entry bfloat16 LUT so that video and sRGB PNG/JPEG frames skip per-pixel float math entirely; output is bit-identical.
+- [#18: Add opt-in `--optimized`: byte-identical output in less memory and time](https://github.com/nikopueringer/CorridorKey2.0/pull/18) by **[adityakamat24](https://github.com/adityakamat24)**
+  - Adds `--optimized` / `--fast` flags enabling bf16 weights, lean activations, prefetch frames, decode-once, async baton, and more. Required significant conflict resolution and MPS-specific gating: `activation_arena`, `pinned_io`, `async_baton`, and `decode_once` are disabled or guarded for unified-memory systems where CUDA-specific allocator tricks don't apply; all `torch.autocast("cuda", ...)` calls were updated to be device-type-aware.
+- [#4: Fix image-sequence frame order and case-insensitive extensions](https://github.com/nikopueringer/CorridorKey2.0/pull/4) by **[Davidhanson90](https://github.com/Davidhanson90)**
+  - Natural sort so `frame_2.png` sorts before `frame_10.png` on Linux, and `.PNG`/`.EXR` extensions are no longer silently skipped.
+- [#6: Keep RMSNorm output dtype under autocast on newer torch](https://github.com/nikopueringer/CorridorKey2.0/pull/6) by **[KyleJFischer](https://github.com/KyleJFischer)**
+  - Newer PyTorch releases promote `F.rms_norm` output to float32 under bf16 autocast, breaking downstream ops with a dtype mismatch. The fix casts the norm output back to the input dtype, a no-op on torch 2.9.1 and a correctness fix on 2.14+.
+- [#9: Reduce inference VRAM with bit-identical output](https://github.com/nikopueringer/CorridorKey2.0/pull/9) by **[Reinbowl](https://github.com/Reinbowl)**
+  - Stores all Linear and Conv weights as bfloat16 and disables `requires_grad` unconditionally at model load, halving resident weight memory for all users on all hardware.
+- [#11: Fix auto-VRAM OOM on first run](https://github.com/nikopueringer/CorridorKey2.0/pull/11) by **[levi-lumin](https://github.com/levi-lumin)**
+  - Replaces the fixed 0.3 GB VRAM margin with `max(1.5 GB, 5 % of total VRAM)`, samples the budget twice with a one-second gap to avoid transient spikes, reports the remaining margin in the log line, and adds an automatic OOM retry (CUDA only) that falls back to a smaller chunk rather than crashing.
+
+Locally tested using a short 1080p video from a cheap USB webcam (featuring me talking in front of an unevently-lit green screen) and a manually edited first-frame alpha hint:
+
+```
+time uv run corridorkey \
+  --input /tmp/clip-10sec.mp4 \
+  --hint_first_frame /tmp/clip-10secFrameHint.png \
+  --hint_quality 0.95 --carry_hint_quality 0.95 \
+  --despill_strength 0.8 \
+  --num_frames 120 --start_mode begin \
+  --output_dir /tmp/ck-output-test \
+  --outputs alpha fg checker \
+  --fast
+```
+
+I confirmed that both Linux and Mac systems produced excellent and visually imperceptible outputs:
+
+- Linux PC with RTX 5070 Ti (16 GB) and 96 GB of RAM: `real 1m2.413s`
+- Apple M4 Pro with 48 GB of unified memory: `real 5m53.890s`
+
+Disclaimer: I don't have any Windows PCs to test on, but I don't *see* anything introduced in this branch that seems like it would break Windows compatibility, assuming it worked in the first place.
+
+
 # CorridorKey 2.0
+
+## Full macOS support on Apple Silicon
+
+**Run CorridorKey 2.0 on your Mac with Metal GPU acceleration.**
+This fork preserves the existing command-line tools and original model weights,
+with memory controls for native 4K processing and optional native MPSGraph
+attention. A complete native 4K clip has been validated on a 24 GB M2 Mac.
+
+**[Get started on macOS →](#apple-silicon-mac)**
+
+---
 
 Welcome to CorridorKey 2.0! You may rest easy, weary artist. The green beast has been slain. The CorridorKey 2.0 model was designed and trained by Zachary Harris, in direct collaboration with Niko and Corridor Digital.
 
@@ -18,25 +78,61 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
 
 ## Setup
 
+### Apple Silicon Mac
+
+Use native arm64 Python 3.12, a macOS version with Metal bfloat16 support
+(macOS 14 or later), and `ffmpeg` on your `PATH`. From the repository root:
+
+```sh
+uv sync
+uv run scripts/download_weights.py
+uv run corridorkey --input /path/to/clip.mp4 --output_dir /path/to/output
+```
+
+The existing CLI automatically selects Metal when CUDA is unavailable.
+Metal uses synchronous uploads and the CPU area-resize operator for dimensions
+unsupported by Metal's adaptive pooling. The CUDA execution path is unchanged.
+The Mac dependencies select a tested OpenCV decoder to avoid corrupted final
+rows in YUV444 video with the older Apple Silicon wheel.
+
+On macOS 15 or later, optional native MPSGraph attention reduces attention
+memory and improves throughput. With Apple's command-line developer tools
+installed, build it in the same Python environment before running inference:
+
+```sh
+uv run scripts/build_mps_attention.py
+```
+
+Rebuild after changing PyTorch or moving the environment. A missing or
+incompatible library uses the bounded PyTorch path. Set
+`CORRIDORKEY_MPS_NATIVE_ATTENTION=0` to disable native attention for comparisons.
+
+Automatic memory selection reserves headroom for unified memory and reduces
+foundation, attention, and MLP batches on smaller Macs. Existing explicit Hann
+and low-VRAM settings retain control. Metal allocation limits remain enabled;
+explicit `PYTORCH_MPS_HIGH_WATERMARK_RATIO` / `PYTORCH_MPS_LOW_WATERMARK_RATIO`
+settings are respected.
+
+A 302-frame 3840×2160 clip completed on a 24 GiB M2 with native attention:
+3 h 58 min end to end, 11.96 GiB sampled inference-process peak (excluding
+separate FFmpeg processes). Both output videos decoded all 302 frames at native
+resolution. Model weights and resolution were preserved. This remains a slow
+offline workflow; automatic settings can use shorter temporal context.
+Native attention can introduce floating-point differences, and identical
+CUDA/Metal pixels are not guaranteed.
+
+### NVIDIA CUDA
+
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
-for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
-environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
-This package was tested with:
+for footage up to 1440p, or 6 GB for 4K, and `ffmpeg` on your PATH. On smaller cards,
+see [Long Clips And Low VRAM](#long-clips-and-low-vram).
+
+From the repository root, install dependencies and download the model weights
+(about 5 GB). `uv` selects the CUDA 12.8 PyTorch wheel automatically on Linux and Windows:
 
 ```
-torch==2.9.1
-torchvision==0.24.1
-```
-
-From the repository root, create an environment, install PyTorch and the
-remaining dependencies, and download the model weights (about 5 GB):
-
-```
-python -m venv venv
-source venv/bin/activate
-pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-python scripts/download_weights.py
+uv sync
+uv run scripts/download_weights.py
 ```
 
 The download script fetches:
@@ -68,7 +164,7 @@ full hint video).
 You can also start the same guided session directly:
 
 ```
-python run_interactive.py /path/to/clip.mp4
+uv run corridorkey-interactive /path/to/clip.mp4
 ```
 
 ## Quick Start
@@ -76,7 +172,7 @@ python run_interactive.py /path/to/clip.mp4
 From the repository root:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/input.mp4 \
   --output_dir /path/to/output
 ```
@@ -99,7 +195,7 @@ the model to decide for itself.
 ### No Hint
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_no_hint
 ```
@@ -117,7 +213,7 @@ Tradeoffs:
 ### First-Frame Hint
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1_hint \
   --hint_first_frame frame_0001_matte.png \
@@ -143,7 +239,7 @@ Tradeoffs:
 ### Full Hint Video
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint \
   --hint_video hint_matte_video.mp4 \
@@ -167,7 +263,7 @@ Tradeoffs:
 ### Full Hint Video Without Carry
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint_no_carry \
   --hint_video hint_matte_video.mp4 \
@@ -200,7 +296,7 @@ Practical values:
 For carried Hann hints, use `--carry_hint_quality`. The default is `0.95`.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1_hint \
   --hint_first_frame frame_0001_matte.png \
@@ -252,7 +348,7 @@ What the settings mean:
 Example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_window_8 \
   --hann_chunk 8 \
@@ -275,7 +371,7 @@ Available output choices:
 Select outputs explicitly:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_review \
   --outputs alpha fg checker cutout
@@ -290,7 +386,7 @@ more ffmpeg encoding. For fastest normal use, keep the default `alpha fg`. Add
 Use `--despill_strength` (value from `0.0` for no despill to `1.0` for full despill, defaults to `0.5`) to configure the despill amount applied to the `checker` and `cutout` outputs.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_despill \
   --outputs checker cutout \
@@ -356,7 +452,7 @@ at most ~0.05% on top of that; `float` adds none.
 Typical HDR round trip from linear EXR plates:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/linear_exr_frames \
   --frame_dir_linear \
   --frame_dir_fps 24 \
@@ -389,7 +485,7 @@ unclipped HDR.
 Override these as needed for your pipeline. For example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_encoded \
   --ffmpeg_codec libx264 \
@@ -424,11 +520,83 @@ These come from measurements on synthetic test clips; other software using the
 GPU reduces what is available. If you hit a CUDA out-of-memory error, pass
 `--low_vram` with a smaller `--hann_chunk` yourself.
 
+### Optimized mode
+
+The launcher's default memory profile, and `--optimized` on the command line,
+run the same model in less memory and less time. With the same window size the
+output is identical; in auto mode the saved memory goes into longer windows:
+
+| GPU memory (free) | 720p | 1080p | 1440p | 3K | 4K |
+|---|---|---|---|---|---|
+| 6 GB laptop (4.95 GB) | 48/24 | 40/20 | 28/14 | 16/8 | 10/5 |
+| 8 GB (6.95 GB) | 64/32 | 56/28 | 40/20 | 24/12 | 16/8 |
+| 12 GB (10.95 GB) | 80/40 normal | 80/40 | 64/32 | 40/20 | 28/14 |
+| 16 GB (14.95 GB) | 80/40 normal | 80/40 normal | 80/40 | 64/32 | 40/20 |
+| 24 GB (22.95 GB) | 80/40 normal | 80/40 normal | 80/40 normal | 80/40 | 64/32 |
+
+Windows picks, low-VRAM mode unless marked normal; the shipped settings on a
+6 GB card are 8/4 at 720p and 1080p, 4/2 at 1440p and 2/1 at 3K and 4K.
+Linux gets a step or two more from 1440p up (a 6 GB card runs 32/16 at 1440p,
+24/12 at 3K and 16/8 at 4K): PyTorch's allocator has expandable segments there
+and not on Windows.
+
+Choose "Auto, original" in the launcher, or leave out `--optimized`, for the
+original settings. The measurements, and how the output was checked, are in
+https://github.com/nikopueringer/CorridorKey2.0/pull/18.
+
+`--optimized` also keeps the GPU busy while the host reads and writes
+frames, and starts faster. Each of these leaves every output file
+byte-identical and can be used on its own:
+
+- `--pinned_io`: frames are quantized to 16 bits on the GPU (the same values
+  as before for every possible input) and copied through pinned memory one
+  frame behind, so the GPU starts the next frame instead of waiting.
+- `--lean_reads`: in low-VRAM mode, stages that only feed the model skip
+  preparing each frame's display view (for linear EXR input that is an sRGB
+  conversion of every pixel).
+- `--read_ahead`: stage 1's first window is read while the prepass runs;
+  later windows and stage 2's frames are read on worker threads.
+- `--fast_load`: the model is built without first filling its weights with
+  random values, since every one is then loaded from the checkpoints.
+- `--decode_once`: each frame is decoded and converted once; the later
+  stages read the model's input back from a temporary file (about 13 MB per
+  1080p frame and 53 MB per 4K frame in `--temp_dir`, twice that in normal
+  mode; skipped when the temp folder is short of space). Most useful at 4K
+  and with EXR input.
+- `--gpu_prep`: with `--decode_once` and a frame folder, each frame's
+  color conversions run on the GPU. For 8-bit images and half-float EXRs
+  the GPU gives the CPU's bits for every possible value; EXRs stored as
+  32-bit float, where a few values round differently, stay on the CPU.
+- `--async_baton`: in low-VRAM mode, stage 1's windows run back to back on
+  the GPU; each window's output is copied back and blended into the
+  finished frames while the GPU runs the next one.
+- `--exr_workers N`: with `--output_format exr`, N frames per output are
+  compressed and written at once (default 1; `--optimized` uses a quarter of
+  the CPU cores, 2 to 8). Each file is still written whole by one thread from
+  the same pixels, so the files are the same. ZIP-compressing a 4K frame
+  takes a CPU core a few seconds, which otherwise sets the pace at 4K.
+
+These were checked on Volta, Turing, Ampere, Ada, Hopper and Blackwell GPUs:
+at the same window, `--optimized` writes the original's files on each. On
+some cards the original's own output varies slightly from run to run
+(cuDNN's default algorithms on an RTX 4090, the carry hint on an RTX 5080);
+with deterministic cuDNN on the 4090 and the carry hint off on the 5080,
+both repeat and agree.
+
+`--fast` is `--optimized` with more threads per video encoder (or pass
+`--ffmpeg_threads N` yourself). The keyed frames are identical, but x264's
+output depends on its thread count, so the encoded files differ slightly
+from the default two-thread encode. On fast GPUs at HD the encoder often
+sets the pace and `--fast` is 5-10% faster; at 4K on a CPU with 16 cores or
+fewer the extra encoder threads compete with frame preparation and can make
+it slower, so measure on your machine. On a 6 GB RTX 3060 Laptop, where the
+GPU sets the pace, it measured 1-3% faster at 1080p and 1440p.
+
 The normal path streams video and does not intentionally hold an entire long
 clip in RAM. To force low-VRAM mode yourself, add:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input long_shot.mp4 \
   --output_dir out_low_vram \
   --low_vram \
@@ -466,7 +634,7 @@ Use the defaults unless you are actively tuning memory behavior.
 read in sorted filename order. Supported extensions are EXR, PNG, JPG, and JPEG.
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/frames \
   --frame_dir_fps 24 \
   --output_dir out_frames
@@ -481,7 +649,7 @@ Frame directories are treated as display-coded by default. If the incoming image
 Example:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input /path/to/linear_exr_frames \
   --frame_dir_fps 24 \
   --frame_dir_linear \
@@ -493,7 +661,7 @@ python infer.py \
 For quick tests, process only part of a clip:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_test \
   --num_frames 100 \
@@ -577,13 +745,13 @@ mismatches raise errors instead of falling back to a different behavior.
 No hint, fastest standard outputs:
 
 ```
-python infer.py --input shot.mp4 --output_dir out_no_hint
+uv run corridorkey --input shot.mp4 --output_dir out_no_hint
 ```
 
 First-frame hint with default carry:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_frame1 \
   --hint_first_frame matte_frame_0001.png \
@@ -593,7 +761,7 @@ python infer.py \
 Full hint video, trusting the provided hint on every pass:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_full_hint \
   --hint_video hint.mp4 \
@@ -604,7 +772,7 @@ python infer.py \
 Review render with checker and cutout:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_review \
   --hint_first_frame matte_frame_0001.png \
@@ -614,7 +782,7 @@ python infer.py \
 Lower-memory 8-frame windows:
 
 ```
-python infer.py \
+uv run corridorkey \
   --input shot.mp4 \
   --output_dir out_lowmem_window \
   --hint_first_frame matte_frame_0001.png \
@@ -642,6 +810,17 @@ commercial projects. What you make with it is yours.
 The full terms are in [LICENSE](LICENSE). The license is a variation of
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) with
 additional terms.
+
+## Contributing
+
+Install the project and its dev dependencies, then run the test suite before and after your changes:
+
+```sh
+uv sync --extra dev
+uv run python -m pytest tests/ -v
+```
+
+The tests cover auto-VRAM selection, frame path ordering, MPS attention, RMSNorm dtype preservation, and window batching. They run on CPU, MPS, or CUDA depending on what is available. CUDA-only tests are skipped automatically on macOS. All tests should pass (some skip on hardware that is not present) before a PR is submitted.
 
 ## Acknowledgements
 

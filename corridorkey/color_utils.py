@@ -61,6 +61,25 @@ def linear_to_srgb(x):
     return t.numpy()
 
 
+def linear_to_srgb_nonneg(x):
+    """linear_to_srgb for a numpy array with no negative values (as after
+    np.maximum(x, 0)): the same values, without computing the negative
+    branch, which torch.where discards for such input. Anything else (NaN,
+    which np.maximum keeps, or a negative) goes through linear_to_srgb."""
+    t = torch.from_numpy(x)
+    if not bool((t >= 0).all()):
+        return linear_to_srgb(x)
+    # The positive branch's ops, in place where linear_to_srgb makes a new
+    # tensor: the same kernels over the same whole-frame tensors.
+    pos_t = t.clamp(min=0.0)
+    pos_pow = pos_t.clamp(min=0.0031308)
+    pos_pow.pow_(1.0 / 2.4)
+    pos_pow.mul_(1.055).sub_(0.055)
+    low = pos_t <= 0.0031308
+    pos_t.mul_(12.92)
+    return torch.where(low, pos_t, pos_pow).numpy()
+
+
 def srgb_to_linear(x):
     """sRGB → Scene-linear RGB (IEC 61966-2-1). Numpy or torch input.
 

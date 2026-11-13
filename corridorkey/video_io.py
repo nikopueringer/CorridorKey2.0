@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import functools
 import glob
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,11 +67,25 @@ def raw_clip_name(path: str | os.PathLike) -> str:
     return name
 
 
+_FRAME_EXTS = (".exr", ".png", ".jpg", ".jpeg")
+
+
+def _natural_key(path: str):
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
 def frame_paths(frame_dir: str | os.PathLike) -> list[str]:
-    paths: list[str] = []
-    for ext in ("*.exr", "*.png", "*.jpg", "*.jpeg"):
-        paths.extend(glob.glob(os.path.join(str(frame_dir), ext)))
-    return sorted(paths)
+    """Image frames in ``frame_dir``, in natural (numeric-aware) order.
+
+    Extensions are matched case-insensitively (``.PNG``/``.EXR`` too) and
+    unpadded numbering (``f_2`` before ``f_10``) keeps temporal order.
+    """
+    frame_dir = str(frame_dir)
+    paths = [os.path.join(frame_dir, n) for n in os.listdir(frame_dir)
+             if n.lower().endswith(_FRAME_EXTS)
+             and os.path.isfile(os.path.join(frame_dir, n))]
+    return sorted(paths, key=_natural_key)
 
 
 def ceil_to_multiple(x: int, q: int) -> int:
@@ -181,6 +199,24 @@ def invert_linear_adjust(linear: np.ndarray, meta: dict) -> np.ndarray:
     return (linear / gain - pivot) / contrast + pivot
 
 
+def _probe_frame_count(video_path: str, fps: float, cap: cv2.VideoCapture) -> int:
+    # CAP_PROP_FRAME_COUNT reads container metadata, which is unreliable for
+    # MP4s whose moov atom count disagrees with the actual encoded duration.
+    # ffprobe's duration × fps gives the correct decodable count; fall back to
+    # the OpenCV metadata count only when ffprobe is unavailable.
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, check=True,
+        )
+        duration_s = float(result.stdout.strip())
+        return max(1, round(duration_s * fps))
+    except Exception:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+
 def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      native_resolution: bool, start_mode: str, seed: int,
                      model_scale: float, linear_brightness: float,
@@ -192,7 +228,7 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     w_native = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    n_total = _probe_frame_count(video_path, native_fps, cap)
     cap.release()
 
     q = int(shape_quantum)
@@ -244,11 +280,12 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     return meta
 
 
-def _read_frame_dir_views(path: str, *, exr_linear: bool):
+def _read_frame_dir_views(path: str, *, exr_linear: bool, need_display: bool = True):
     raw = read_image_rgb(path)
     if exr_linear:
         linear = raw.astype(np.float32, copy=False)
-        display = np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
+        display = (np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
+                   if need_display else None)
     else:
         display = np.clip(raw.astype(np.float32, copy=False), 0.0, 1.0)
         linear = cu.srgb_to_linear(display)
@@ -296,18 +333,84 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
     return meta
 
 
-def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
+@functools.lru_cache(maxsize=8)
+def _uint8_view_luts(gain: float, contrast: float, pivot: float):
+    """bfloat16 bit patterns of each preprocessed view for all 256 code values.
+
+    Without a resize every view is a pure per-pixel function of the 8-bit code
+    value, so the float sRGB decode and asinh encode only need to run 256 times
+    instead of once per pixel. The tables are built by the same functions as
+    the float path, so the resulting tensors are identical.
+    """
+    meta = {"linear_brightness": gain, "linear_contrast": contrast,
+            "linear_contrast_pivot": pivot}
+    # Repeat each code so it is evaluated by the same vectorized kernels as a
+    # full frame rather than by a scalar tail loop.
+    rep = 64
+    frame = np.repeat(np.arange(256, dtype=np.uint8), rep).astype(np.float32) / 255.0
+    linear_model = apply_linear_adjust(cu.srgb_to_linear(frame), meta)
+
+    def bits(x: np.ndarray) -> np.ndarray:
+        t = torch.from_numpy(np.ascontiguousarray(x[::rep]))
+        return t.to(dtype=torch.bfloat16).view(torch.int16).numpy()
+
+    review = bits(frame)
+    foundation = (bits(cu.linear_to_vfm_sdr(linear_model))
+                  if has_linear_adjust(meta) else review)
+    return bits(cu.linear_to_asinh(linear_model)), foundation, review
+
+
+def _lut_to_bf16(chw_u8: np.ndarray, lut_bits: np.ndarray) -> torch.Tensor:
+    out = cv2.LUT(chw_u8.reshape(-1, chw_u8.shape[-1]), lut_bits)
+    return torch.from_numpy(out.reshape(chw_u8.shape)).view(torch.bfloat16)
+
+
+def _preprocess_uint8_bgr_views(frame_bgr: np.ndarray, meta: dict, *,
+                                need_model: bool, need_display: bool = True):
+    """Table-lookup equivalent of the float path for unscaled 8-bit frames."""
+    h_out, w_out = meta["shape_hw"]
+    # Reflect padding copies pixels, so it commutes with the per-pixel lookup.
+    padded, _ = center_pad_to_shape(frame_bgr, h_out, w_out)
+    chw = np.ascontiguousarray(padded.transpose(2, 0, 1)[::-1])
+    model_lut, foundation_lut, review_lut = _uint8_view_luts(
+        float(meta.get("linear_brightness", 1.0)),
+        float(meta.get("linear_contrast", 1.0)),
+        float(meta.get("linear_contrast_pivot", 0.18)))
+    if need_display:
+        review = _lut_to_bf16(chw, review_lut)
+        foundation = (review if foundation_lut is review_lut
+                      else _lut_to_bf16(chw, foundation_lut))
+    else:
+        review = foundation = None
+    model = _lut_to_bf16(chw, model_lut) if need_model else None
+    return model, foundation, review
+
+
+def _is_unscaled_uint8_bgr(frame, meta: dict) -> bool:
+    return (frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3
+            and frame.shape[:2] == tuple(meta["model_native_hw"]))
+
+
+def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool,
+                                 need_display: bool = True):
+    """`need_display=False` (with `need_model`): only the model view; the
+    foundation and review views come back as None."""
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    if _is_unscaled_uint8_bgr(frame_bgr, meta):
+        return _preprocess_uint8_bgr_views(frame_bgr, meta, need_model=need_model, need_display=need_display)
     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     frame = resize_hwc_lanczos(frame, (h_model, w_model))
     frame, _ = center_pad_to_shape(frame, h_out, w_out)
-    review = torch.from_numpy(frame.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    review = (torch.from_numpy(frame.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+              if need_display or not need_model else None)
     if not need_model and not has_linear_adjust(meta):
         return None, review, review
     linear = cu.srgb_to_linear(frame)
     linear_model = apply_linear_adjust(linear, meta)
-    if has_linear_adjust(meta):
+    if review is None:
+        foundation = None
+    elif has_linear_adjust(meta):
         foundation_np = cu.linear_to_vfm_sdr(linear_model)
         foundation = torch.from_numpy(
             foundation_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
@@ -320,16 +423,33 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     return model_t, foundation, review
 
 
-def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
+def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool,
+                              need_display: bool = True):
+    """`need_display=False` (with `need_model`): only the model view; the
+    display views come back as None."""
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    need_display = need_display or not need_model
+    if (not meta.get("exr_linear", False)
+            and not str(path).lower().endswith(".exr")):
+        # sRGB PNG/JPEG frames take the same table-lookup path as video.
+        frame_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise FileNotFoundError(path)
+        if _is_unscaled_uint8_bgr(frame_bgr, meta):
+            return _preprocess_uint8_bgr_views(
+                frame_bgr, meta, need_model=need_model, need_display=need_display)
     display, linear = _read_frame_dir_views(
-        path, exr_linear=bool(meta.get("exr_linear", False)))
-    display = resize_hwc_lanczos(display, (h_model, w_model))
+        path, exr_linear=bool(meta.get("exr_linear", False)),
+        need_display=need_display)
+    display_t = None
+    if need_display:
+        display = resize_hwc_lanczos(display, (h_model, w_model))
     linear = resize_hwc_lanczos(linear, (h_model, w_model))
-    display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
-    display_t = torch.from_numpy(
-        display.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    if need_display:
+        display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
+        display_t = torch.from_numpy(
+            display.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
     if not need_model:
         return None, display_t, display_t
     linear, _ = center_pad_to_shape(linear, h_out, w_out)
@@ -339,9 +459,13 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
 
 
 class SequentialVideoWindowReader:
-    def __init__(self, video_path: str, meta: dict):
+    """`model_only`: prepare and return only the model view (the foundation
+    and review views come back as None)."""
+
+    def __init__(self, video_path: str, meta: dict, *, model_only: bool = False):
         self.video_path = video_path
         self.meta = meta
+        self.model_only = model_only
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
@@ -363,23 +487,35 @@ class SequentialVideoWindowReader:
                     f"{self.video_path}: failed decoding frame "
                     f"{self.start_frame + self.next_t}")
             self.cache[self.next_t] = preprocess_video_frame_views(
-                frame, self.meta, need_model=True)
+                frame, self.meta, need_model=True, need_display=not self.model_only)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
-        self._read_until(t1)
-        model = torch.stack([self.cache[t][0] for t in range(t0, t1)])
-        foundation = torch.stack([self.cache[t][1] for t in range(t0, t1)])
-        review = torch.stack([self.cache[t][2] for t in range(t0, t1)])
-        for old_t in [k for k in self.cache if k < t0]:
-            del self.cache[old_t]
-        return model, foundation, review
+        return _stack_window(self, t0, t1)
+
+
+def _stack_window(reader, t0: int, t1: int):
+    reader._read_until(t1)
+    cache = reader.cache
+    model = torch.stack([cache[t][0] for t in range(t0, t1)])
+    if reader.model_only:
+        foundation = review = None
+    else:
+        foundation = torch.stack([cache[t][1] for t in range(t0, t1)])
+        review = torch.stack([cache[t][2] for t in range(t0, t1)])
+    for old_t in [k for k in cache if k < t0]:
+        del cache[old_t]
+    return model, foundation, review
 
 
 class SequentialFrameDirWindowReader:
-    def __init__(self, frame_dir: str, meta: dict):
+    """`model_only`: prepare and return only the model view (the foundation
+    and review views come back as None)."""
+
+    def __init__(self, frame_dir: str, meta: dict, *, model_only: bool = False):
         self.frame_dir = frame_dir
         self.meta = meta
+        self.model_only = model_only
         self.paths = meta["frame_paths"]
         self.next_t = 0
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -390,17 +526,188 @@ class SequentialFrameDirWindowReader:
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
             self.cache[self.next_t] = preprocess_frame_dir_path(
-                self.paths[self.next_t], self.meta, need_model=True)
+                self.paths[self.next_t], self.meta, need_model=True,
+                need_display=not self.model_only)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
-        self._read_until(t1)
-        model = torch.stack([self.cache[t][0] for t in range(t0, t1)])
-        foundation = torch.stack([self.cache[t][1] for t in range(t0, t1)])
-        review = torch.stack([self.cache[t][2] for t in range(t0, t1)])
-        for old_t in [k for k in self.cache if k < t0]:
-            del self.cache[old_t]
-        return model, foundation, review
+        return _stack_window(self, t0, t1)
+
+
+def preprocess_frame_dir_foundation(path: str, meta: dict) -> torch.Tensor:
+    """The foundation view of preprocess_frame_dir_path (`need_model=False`),
+    without computing the scene-linear view it does not use."""
+    h_out, w_out = meta["shape_hw"]
+    h_model, w_model = meta["model_native_hw"]
+    raw = read_image_rgb(path)
+    if bool(meta.get("exr_linear", False)):
+        linear = raw.astype(np.float32, copy=False)
+        display = np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
+    else:
+        display = np.clip(raw.astype(np.float32, copy=False), 0.0, 1.0)
+    display = resize_hwc_lanczos(display, (h_model, w_model))
+    display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
+    return torch.from_numpy(display.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+
+
+def preprocess_frame_dir_both(path: str, meta: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """(foundation view, model view) of a frame-folder frame from one decode:
+    the foundation view preprocess_frame_dir_foundation returns and the model
+    view preprocess_frame_dir_path returns, computed by the same steps from
+    the same decoded array (none of them writes into an input). For linear
+    EXR the display conversion skips the negative branch
+    (cu.linear_to_srgb_nonneg: same values)."""
+    return preprocess_raw_both(read_image_rgb(path), meta)
+
+
+def preprocess_raw_both(raw: np.ndarray, meta: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    h_out, w_out = meta["shape_hw"]
+    h_model, w_model = meta["model_native_hw"]
+    if bool(meta.get("exr_linear", False)):
+        linear = raw.astype(np.float32, copy=False)
+        display = np.clip(cu.linear_to_srgb_nonneg(np.maximum(linear, 0.0)), 0.0, 1.0)
+    else:
+        display = np.clip(raw.astype(np.float32, copy=False), 0.0, 1.0)
+        linear = cu.srgb_to_linear(display)
+    display = resize_hwc_lanczos(display, (h_model, w_model))
+    display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
+    foundation_t = torch.from_numpy(display.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    linear = resize_hwc_lanczos(linear, (h_model, w_model))
+    linear, _ = center_pad_to_shape(linear, h_out, w_out)
+    model = cu.linear_to_asinh(linear)
+    model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    return foundation_t, model_t
+
+
+def exr_rgb_is_half(path) -> bool:
+    with open(path, "rb") as f:
+        head = f.read(65536)
+    if len(head) < 8 or head[:4] != b"\x76\x2f\x31\x01" or head[5] & 0x18:
+        return False
+    try:
+        pos = 8
+        while head[pos] != 0:
+            name_end = head.index(b"\0", pos)
+            type_end = head.index(b"\0", name_end + 1)
+            size = int.from_bytes(head[type_end + 1:type_end + 5], "little")
+            value = head[type_end + 5:type_end + 5 + size]
+            if head[pos:name_end] == b"channels":
+                types, i = {}, 0
+                while value[i] != 0:
+                    ch_end = value.index(b"\0", i)
+                    types[value[i:ch_end]] = int.from_bytes(value[ch_end + 1:ch_end + 5], "little")
+                    i = ch_end + 17
+                return all(types.get(c) == 1 for c in (b"R", b"G", b"B"))
+            pos = type_end + 5 + size
+    except (ValueError, IndexError):
+        pass
+    return False
+
+
+def iter_frame_dir_views_on_device(meta: dict, device, workers: int = 4):
+    from concurrent.futures import ThreadPoolExecutor
+    n = int(meta["num_frames"])
+    paths = meta["frame_paths"]
+    lookahead = 2 * max(1, workers)
+
+    def decode(path):
+        raw = read_image_rgb(path)
+        if str(path).lower().endswith(".exr") and not exr_rgb_is_half(path):
+            return None, preprocess_raw_both(raw, meta)
+        return raw, None
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {}
+        for t in range(n):
+            for u in range(t, min(n, t + lookahead)):
+                if u not in futures:
+                    futures[u] = pool.submit(decode, paths[u])
+            raw, views = futures.pop(t).result()
+            if views is None:
+                yield t, frame_dir_views_on_device(raw, meta, device)
+            else:
+                yield t, tuple(v.to(device) for v in views)
+
+
+def frame_dir_views_on_device(raw: np.ndarray, meta: dict, device,
+                              band_rows: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+    h_out, w_out = meta["shape_hw"]
+    h, w = raw.shape[:2]
+    exr_linear = bool(meta.get("exr_linear", False))
+    src = torch.from_numpy(raw).to(device)
+    display = torch.empty((h, w, 3), dtype=torch.bfloat16, device=device)
+    model = torch.empty_like(display)
+    for r0 in range(0, h, band_rows):
+        x = src[r0:r0 + band_rows]
+        if exr_linear:
+            linear = x
+            disp = cu.linear_to_srgb(x.clamp(min=0.0)).clamp_(0.0, 1.0).add_(0.0)
+        else:
+            disp = x.clamp(0.0, 1.0).add_(0.0)
+            linear = cu.srgb_to_linear(disp)
+        display[r0:r0 + band_rows] = disp
+        model[r0:r0 + band_rows] = cu.linear_to_asinh(linear)
+    pad_t, pad_l = (h_out - h) // 2, (w_out - w) // 2
+    pads = (pad_l, w_out - w - pad_l, pad_t, h_out - h - pad_t)
+
+    def chw(v):
+        v = v.permute(2, 0, 1).unsqueeze(0)
+        if any(pads):
+            v = torch.nn.functional.pad(v, pads, mode="reflect")
+        return v[0]
+
+    return chw(display), chw(model)
+
+
+def iter_foundation_frames(source: str, meta: dict, *, reader_kind: str,
+                           workers: int = 4, with_model: bool = False):
+    """Yields (t, frame) in order: the frames iter_*_frame_chunks stack with
+    `need_model=False`, preprocessed on `workers` threads (decoding a video
+    stays sequential). Same tensors, decoded once, faster. `with_model`:
+    yields (t, (frame, model view)) from the same decode."""
+    from concurrent.futures import ThreadPoolExecutor
+    n = int(meta["num_frames"])
+    lookahead = 2 * max(1, workers)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        if reader_kind == "frame_dir":
+            paths = meta["frame_paths"]
+            futures = {}
+            for t in range(n):
+                for u in range(t, min(n, t + lookahead)):
+                    if u not in futures:
+                        futures[u] = (pool.submit(preprocess_frame_dir_both, paths[u], meta)
+                                      if with_model else
+                                      pool.submit(preprocess_frame_dir_foundation, paths[u], meta))
+                yield t, futures.pop(t).result()
+            return
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {source}")
+        if int(meta["start_frame"]):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(meta["start_frame"]))
+        futures = {}
+        read = 0
+        try:
+            for t in range(n):
+                while read < n and read < t + lookahead:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if with_model:
+                        futures[read] = pool.submit(
+                            lambda f: (lambda v: (v[1], v[0]))(
+                                preprocess_video_frame_views(f, meta, need_model=True)),
+                            frame)
+                    else:
+                        futures[read] = pool.submit(
+                            lambda f: preprocess_video_frame_views(f, meta, need_model=False)[1],
+                            frame)
+                    read += 1
+                if t not in futures:
+                    raise RuntimeError(f"{source}: decoded only {t}/{n} requested frames")
+                yield t, futures.pop(t).result()
+        finally:
+            cap.release()
 
 
 def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
@@ -707,11 +1014,14 @@ class ExrSequenceWriter:
     matching the layout convention of ThreadedVideoWriter/cv2. Values are
     written as-is: no clamping and no quantization. `dtype` selects the EXR
     pixel type: "half" (float16, VFX standard) or "float" (full float32).
+    `workers` > 1 (opt-in): compress and write that many frames at once, each
+    file still written whole by one thread from the same array, so the files
+    are the same; one ZIP-compressed 4K frame takes a core seconds.
     """
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
                  channels: int = 3, dtype: str = "half", maxsize: int = 2,
-                 frame_name: str = "frame"):
+                 frame_name: str = "frame", workers: int = 1):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
         self.dir_path = str(dir_path)
@@ -730,14 +1040,23 @@ class ExrSequenceWriter:
         self.frame_idx = 0
         self.q = queue.Queue(maxsize=maxsize)
         self.err = None
+        self.workers = max(1, int(workers))
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
+    def _write_frame(self, out_path: str, frame: np.ndarray):
+        if not cv2.imwrite(out_path, frame, self.imwrite_params):
+            raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+
     def _worker(self):
+        pool = ThreadPoolExecutor(max_workers=self.workers) if self.workers > 1 else None
+        inflight = deque()
         try:
             while True:
                 item = self.q.get()
                 if item is None:
+                    while inflight:
+                        inflight.popleft().result()
                     self.q.task_done()
                     return
                 idx0, arr = item
@@ -750,11 +1069,18 @@ class ExrSequenceWriter:
                     frame = np.ascontiguousarray(arr[j])
                     if frame.shape[-1] == 1:
                         frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+                    if pool is None:
+                        self._write_frame(out_path, frame)
+                        continue
+                    inflight.append(pool.submit(self._write_frame, out_path, frame))
+                    while len(inflight) >= 2 * self.workers:
+                        inflight.popleft().result()
                 self.q.task_done()
         except Exception as exc:
             self.err = exc
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
 
     def write_many(self, frames: np.ndarray):
         if self.err is not None:

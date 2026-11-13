@@ -68,7 +68,7 @@ class LayerNorm2d(nn.Module):
         # Cast weight to input dtype so F.rms_norm's fused kernel dispatches
         # (autocast keeps params fp32; mismatch blocks the fast path).
         w = self.weight.to(x.dtype) if self.weight is not None else None
-        x = F.rms_norm(x, (self.num_channels,), w, self.eps)
+        x = F.rms_norm(x, (self.num_channels,), w, self.eps).to(x.dtype)
         return x.permute(0, 3, 1, 2).contiguous()
 
 
@@ -87,8 +87,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Newer torch autocast returns fp32 from rms_norm; keep the input dtype.
         return F.rms_norm(x, self.normalized_shape,
-                           self.weight.to(x.dtype), self.eps)
+                           self.weight.to(x.dtype), self.eps).to(x.dtype)
 
 
 def icnr_init_(conv: nn.Conv2d, upscale_factor: int):
@@ -309,6 +310,13 @@ class SwiGLU(nn.Module):
         y = self.dw(y).permute(0, 2, 3, 1)
         return y.reshape(shape_out)
 
+    def _gated(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self, 'inference_inplace_mlp', False) and not self.training:
+            # Same values as below with two hidden-size temporaries fewer:
+            # silu and the product overwrite the fresh w_gate output.
+            return F.silu(self.w_gate(x), inplace=True).mul_(self.w_up(x))
+        return F.silu(self.w_gate(x)) * self.w_up(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         chunk_tokens = int(getattr(self, 'inference_chunk_tokens', 0) or 0)
         if (chunk_tokens > 0 and not self.training and self.dw is None
@@ -319,10 +327,10 @@ class SwiGLU(nn.Module):
             out = y.new_empty(y.shape)
             for start in range(0, y.shape[0], chunk_tokens):
                 yi = y[start:start + chunk_tokens]
-                h = F.silu(self.w_gate(yi)) * self.w_up(yi)
+                h = self._gated(yi)
                 out[start:start + yi.shape[0]] = self.w_down(h)
             return out.reshape(shape)
-        h = F.silu(self.w_gate(x)) * self.w_up(x)
+        h = self._gated(x)
         h = self._dw_spatial(h)
         return self.w_down(h)
 
@@ -366,7 +374,7 @@ class DepthwiseSwiGLU2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, H, W, C). Returns a residual branch in the same layout."""
-        u = self.norm(x)
+        u = _bf16_branch_input(self, self.norm(x))
         # NHWC-contiguous -> NCHW shape with channels-last strides. Avoid an
         # explicit contiguous copy; cuDNN handles this layout efficiently.
         u = u.permute(0, 3, 1, 2)
@@ -396,6 +404,55 @@ class DepthwiseSwiGLU2D(nn.Module):
         y = y[:, :, 0] * F.silu(y[:, :, 1])
         y = y * self.gamma.to(y.dtype).view(1, -1, 1, 1)
         return y.permute(0, 2, 3, 1)
+
+
+def _bf16_branch_input(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Opt-in (`inference_bf16_branch_input`): the normalized input of an
+    attention, MLP or local-mix branch, cast to the autocast dtype.
+
+    Inside those branches the input only reaches Linear/Conv layers, which
+    autocast casts to bf16 anyway, and copies (pad, roll, permute) of it.
+    Casting once up front gives the Linear/Conv layers the same values and
+    halves the copies. The CSwin gate product rounds to the same bf16 value
+    either way (a bf16 x bf16 product is exact in fp32).
+    """
+    if (getattr(module, 'inference_bf16_branch_input', False) and not module.training
+            and torch.is_autocast_enabled(x.device.type)):
+        return x.to(torch.get_autocast_dtype(x.device.type))
+    return x
+
+
+def _residual_add(module: nn.Module, shortcut: torch.Tensor,
+                  branch: torch.Tensor) -> torch.Tensor:
+    """shortcut + branch. With `inference_inplace_residual`, set only on
+    blocks whose caller hands over its only reference to the block input
+    (Stage1._swin3d_run_lean), the sum goes into shortcut's buffer: the same
+    elementwise add, without a second residual-sized tensor."""
+    if (getattr(module, 'inference_inplace_residual', False) and not module.training
+            and torch.result_type(shortcut, branch) == shortcut.dtype
+            and branch.shape == shortcut.shape):
+        return shortcut.add_(branch)
+    return shortcut + branch
+
+
+def _chunked_local_mix(local_mix: nn.Module, x: torch.Tensor,
+                       frame_chunk: int, inplace: bool = False) -> torch.Tensor:
+    """x + local_mix(x) for x (B, T, H, W, C), `frame_chunk` frames at a time.
+
+    The local mix works per frame (RMSNorm per token, reflect pad and
+    depthwise conv per frame), so this is the same math as one call over all
+    frames, with only one chunk's normalized, padded and conv intermediates
+    alive at a time. With `inplace` the sums go back into x (each chunk's
+    mix is computed before its frames are overwritten).
+    """
+    B, T, H, W, C = x.shape
+    out = x if inplace else torch.empty_like(x)
+    for t0 in range(0, T, frame_chunk):
+        xt = x[:, t0:t0 + frame_chunk]
+        y = local_mix(xt.reshape(-1, H, W, C))
+        torch.add(xt, y.reshape(xt.shape), out=out[:, t0:t0 + frame_chunk])
+        del y
+    return out
 
 
 class AdaLNZero(nn.Module):
@@ -869,6 +926,20 @@ def _shifted_region_groups_3d_cached(
     )
 
 
+_REGION_INDEX_CACHE: dict | None = None
+# Whether a row band's QKV projection gives the whole frame's bits, per shape.
+_BAND_GEMM_EXACT: dict = {}
+
+
+def set_region_index_cache(enabled: bool) -> None:
+    """Opt-in: keep the index tensors of shifted-window region groups on the
+    GPU across calls. Without it every call uploads them from Python tuples,
+    and each upload waits for the GPU to finish its queued work, so the GPU
+    idles while the CPU catches up. Same indices, same results."""
+    global _REGION_INDEX_CACHE
+    _REGION_INDEX_CACHE = {} if enabled else None
+
+
 def _sdpa_with_region_groups(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -885,14 +956,28 @@ def _sdpa_with_region_groups(
             f"cached window count {num_windows} does not divide attention "
             f"window batch {q.shape[0]}")
     batch_windows = q.shape[0] // num_windows
+    cache = _REGION_INDEX_CACHE
+
+    def _index(values: tuple[int, ...]) -> torch.Tensor:
+        if cache is None:
+            return torch.tensor(values, device=q.device, dtype=torch.long)
+        key = ("idx", values, q.device)
+        if key not in cache:
+            cache[key] = torch.tensor(values, device=q.device, dtype=torch.long)
+        return cache[key]
 
     def _batched_windows(base: tuple[int, ...]) -> torch.Tensor:
-        idx = torch.tensor(base, device=q.device, dtype=torch.long)
-        if batch_windows == 1 or idx.numel() == 0:
-            return idx
-        offsets = torch.arange(
-            batch_windows, device=q.device, dtype=torch.long) * num_windows
-        return (idx.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        key = ("win", base, batch_windows, num_windows, q.device)
+        if cache is not None and key in cache:
+            return cache[key]
+        idx = _index(base)
+        if batch_windows != 1 and idx.numel() != 0:
+            offsets = torch.arange(
+                batch_windows, device=q.device, dtype=torch.long) * num_windows
+            idx = (idx.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        if cache is not None:
+            cache[key] = idx
+        return idx
 
     out = torch.zeros_like(q)
     if full_idx:
@@ -914,7 +999,7 @@ def _sdpa_with_region_groups(
     out_nlhd = out.permute(0, 2, 1, 3)
     for token_tuple, win_tuple in groups:
         win_idx = _batched_windows(win_tuple)
-        token_idx = torch.tensor(token_tuple, device=q.device, dtype=torch.long)
+        token_idx = _index(token_tuple)
         attn = F.scaled_dot_product_attention(
             q.index_select(0, win_idx).index_select(2, token_idx),
             k.index_select(0, win_idx).index_select(2, token_idx),
@@ -929,6 +1014,45 @@ def _sdpa_with_region_groups(
 # ---------------------------------------------------------------------------
 # Attention cores
 # ---------------------------------------------------------------------------
+
+
+def _window_attention_batched(q, k, v, *, window_batch=0,
+                              attn_mask=None, region_ids=None,
+                              region_groups=None):
+    """Bound independent window batches without changing their token sets.
+
+    Cached shifted-window groups use indices within each image. Rebase them
+    into each chunk, including chunks crossing an image boundary.
+    """
+    count = q.shape[0]
+    step = window_batch if window_batch > 0 else count
+    out = torch.empty_like(q)
+    for start in range(0, count, step):
+        end = min(start + step, count)
+        qs, ks, vs = q[start:end], k[start:end], v[start:end]
+        if region_groups is not None:
+            num_windows, full_idx, groups = region_groups
+            if num_windows <= 0:
+                value = F.scaled_dot_product_attention(qs, ks, vs)
+            else:
+                if count % num_windows:
+                    raise ValueError("cached window count does not divide attention batch")
+                def rebase(indices):
+                    return tuple(i - start for i in range(start, end)
+                                 if i % num_windows in indices)
+                sliced = tuple((tokens, wins) for tokens, indices in groups
+                               if (wins := rebase(indices)))
+                value = _sdpa_with_region_groups(
+                    qs, ks, vs, end - start, rebase(full_idx), sliced)
+        elif attn_mask is not None:
+            value = F.scaled_dot_product_attention(
+                qs, ks, vs, attn_mask=attn_mask[start:end])
+        elif region_ids is not None:
+            value = _sdpa_with_region_ids(qs, ks, vs, region_ids[start:end])
+        else:
+            value = F.scaled_dot_product_attention(qs, ks, vs)
+        out[start:end] = value
+    return out
 
 
 class _QKVProj(nn.Module):
@@ -1131,7 +1255,25 @@ class SwinAttention2D(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        if region_groups is not None:
+        window_batch = int(getattr(self, 'inference_window_batch', 0) or 0)
+        if window_batch > 0 and not self.training and nW_total > window_batch:
+            mask = None
+            if attn_mask is not None:
+                nW = int(attn_mask.shape[0])
+                if nW_total % nW:
+                    raise ValueError("attention mask windows do not divide q batch")
+                mask = attn_mask.unsqueeze(0).expand(
+                    nW_total // nW, -1, -1, -1).reshape(nW_total, 1, N, N)
+            elif has_pad and region_groups is None and region_ids is None:
+                real = torch.zeros(Hp, Wp, dtype=torch.bool, device=x.device)
+                real[:H, :W] = True
+                real = real.view(Hp // w, w, Wp // w, w).permute(0, 2, 1, 3)
+                mask = real.reshape(1, -1, N).expand(B, -1, -1)
+                mask = mask.reshape(nW_total, 1, 1, N)
+            attn = _window_attention_batched(
+                q, k, v, window_batch=window_batch, attn_mask=mask,
+                region_ids=region_ids, region_groups=region_groups)
+        elif region_groups is not None:
             attn = _sdpa_with_region_groups(q, k, v, *region_groups)
         elif attn_mask is not None:
             nW = int(attn_mask.shape[0])
@@ -1386,6 +1528,11 @@ class SwinAttention3D(nn.Module):
         bottom/right and masks padded keys out of attention. T is always
         used in full (T_w = T, no temporal padding).
         """
+        if (getattr(self, 'inference_lean', False) and not self.training
+                and region_ids is None):
+            out = self._forward_lean(x, t_stride, region_groups)
+            if out is not None:
+                return out
         B, T, H, W, C = x.shape
         T_w = T
         H_w = self.window_H
@@ -1594,6 +1741,181 @@ class SwinAttention3D(nn.Module):
         out = window_unpartition_3d(out_w, T_w, H_w, W_w, (T, Hp, Wp), B)
         if has_pad:
             out = out[:, :, :H, :W, :].contiguous()
+        return out
+
+    def _forward_lean(
+        self,
+        x: torch.Tensor,
+        t_stride: float,
+        region_groups,
+    ) -> torch.Tensor | None:
+        """Batched-window inference path without full-grid copies.
+
+        Same windows, same batches and the same per-window math as the lazy
+        window path in `forward`. The difference is that windows are cut
+        straight from the unpadded input, zero-filled only where a window
+        crosses the bottom/right edge, and each batch's result goes straight
+        into the unpadded output. That skips the padded copy of the input, the
+        padded output buffer, the unpartition copy and the final crop: four
+        full-grid tensors in the residual dtype. Returns None when the lazy
+        path would not be taken, so `forward` falls back to the original code.
+        """
+        B, T, H, W, C = x.shape
+        H_w, W_w = self.window_H, self.window_W
+        pad_h, pad_w = (-H) % H_w, (-W) % W_w
+        has_pad = pad_h != 0 or pad_w != 0
+        Hp, Wp = H + pad_h, W + pad_w
+        N = T * H_w * W_w
+        nH_w, nW_w = Hp // H_w, Wp // W_w
+        per_b = nH_w * nW_w
+        nW_total = B * per_b
+        window_batch = int(getattr(self, 'inference_window_batch', 0) or 0)
+        if window_batch <= 0:
+            max_windows = max(1, 200_000_000 // max(1, N * C))
+            if nW_total > max_windows:
+                window_batch = max_windows
+        if not (window_batch > 0 and nW_total > window_batch
+                and (region_groups is None or B == 1)):
+            return None
+
+        def slice_groups(start: int, end: int):
+            if region_groups is None:
+                return None
+            if B != 1:
+                return region_groups
+            num_windows, full_idx, groups = region_groups
+            if num_windows != nW_total:
+                return region_groups
+            full = tuple(idx - start for idx in full_idx if start <= idx < end)
+            sliced = []
+            for token_tuple, win_tuple in groups:
+                wins = tuple(idx - start for idx in win_tuple if start <= idx < end)
+                if wins:
+                    sliced.append((token_tuple, wins))
+            return (end - start, full, tuple(sliced))
+
+        pad_attn_mask = None
+        if has_pad and region_groups is None:
+            real = torch.zeros(Hp, Wp, dtype=torch.bool, device=x.device)
+            real[:H, :W] = True
+            real = real.view(nH_w, H_w, nW_w, W_w).permute(0, 2, 1, 3).contiguous()
+            per_win_hw = real.view(per_b, H_w * W_w)
+            per_win_mask = per_win_hw.unsqueeze(1).expand(-1, T, -1).reshape(per_b, N)
+            pad_attn_mask = per_win_mask.unsqueeze(0).expand(B, -1, -1).reshape(nW_total, 1, 1, N)
+
+        cos, sin = self.rope.get_cos_sin(T, H_w, W_w, device=x.device, t_stride=t_stride)
+
+        def locate(idx: int) -> tuple[int, int, int]:
+            b = idx // per_b
+            ih, iw = divmod(idx - b * per_b, nW_w)
+            return b, ih * H_w, iw * W_w
+
+        def take(grid: torch.Tensor, start: int, end: int, row0: int = 0) -> torch.Tensor:
+            wins = []
+            for idx in range(start, end):
+                b, h0, w0 = locate(idx)
+                win = grid[b, :, h0 - row0:h0 - row0 + H_w, w0:w0 + W_w, :]
+                ph, pw = H_w - win.shape[1], W_w - win.shape[2]
+                if ph or pw:
+                    win = F.pad(win, (0, 0, 0, pw, 0, ph))
+                wins.append(win)
+            return torch.stack(wins, dim=0)
+
+        frame_chunk = int(getattr(self, 'inference_qkv_frame_chunk', 0) or 0)
+        frame_chunk = max(1, frame_chunk) if frame_chunk > 0 else T
+        # Opt-in: build the depthwise-filtered QKV only for the rows a window
+        # batch covers (plus the conv's halo) instead of the whole grid.
+        band = bool(getattr(self, 'inference_qkv_band', False)) and self.qkv_dw is not None
+
+        def qkv_rows(a: int, z: int) -> torch.Tensor:
+            # The band's projection is a GEMM with fewer rows than the
+            # frame's. cuBLAS may pick a different kernel for it (it does on
+            # an RTX 3090 for one band shape at 1080p), which changes the
+            # bits, so the band GEMM is used only where it matches the
+            # whole-frame GEMM on this input; otherwise each frame is
+            # projected whole and the band cut out.
+            key = (B, z - a, H, W, C, min(frame_chunk, T), x.dtype, x.device,
+                   torch.is_autocast_enabled(x.device.type), torch.get_autocast_dtype(x.device.type))
+            if key not in _BAND_GEMM_EXACT:
+                t1 = min(frame_chunk, T)
+                whole = self.qkv.qkv(x[:, :t1])[:, :, a:z].contiguous()
+                part = self.qkv.qkv(x[:, :t1, a:z])
+                _BAND_GEMM_EXACT[key] = (whole.dtype == part.dtype and torch.equal(
+                    whole.view(torch.int16) if whole.element_size() == 2 else whole.view(torch.int32),
+                    part.view(torch.int16) if part.element_size() == 2 else part.view(torch.int32)))
+                del whole, part
+            grid = None
+            for t_start in range(0, T, frame_chunk):
+                t_end = min(t_start + frame_chunk, T)
+                if _BAND_GEMM_EXACT[key]:
+                    y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end, a:z]))
+                else:
+                    y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end]))[:, :, a:z]
+                if grid is None:
+                    grid = y.new_empty(B, T, z - a, W, 3 * C)
+                grid[:, t_start:t_end] = y
+                del y
+            return grid
+
+        qkv_grid = None
+        if self.qkv_dw is not None and not band:
+            for t_start in range(0, T, frame_chunk):
+                t_end = min(t_start + frame_chunk, T)
+                y = self.qkv_dw(self.qkv.qkv(x[:, t_start:t_end]))
+                if qkv_grid is None:
+                    qkv_grid = y.new_empty(B, T, H, W, 3 * C)
+                qkv_grid[:, t_start:t_end] = y
+                del y
+
+        out = x.new_empty((B, T, H, W, C))
+        for start in range(0, nW_total, window_batch):
+            end = min(start + window_batch, nW_total)
+            gate_tokens = take(x, start, end).reshape(end - start, N, C)
+            if band:
+                # Rows [r0, r1) of this batch's windows, with the conv's halo:
+                # rows inside the band see the same neighbours (or the same
+                # reflected border) as in the full grid.
+                r0 = min(locate(i)[1] for i in range(start, end))
+                r1 = min(H, max(locate(i)[1] for i in range(start, end)) + H_w)
+                a = max(0, r0 - self.qkv_dw.pad)
+                z = min(H, r1 + self.qkv_dw.pad)
+                qkv = (take(qkv_rows(a, z), start, end, row0=a)
+                       .reshape(end - start, N, 3, self.num_heads, self.head_dim)
+                       .permute(2, 0, 3, 1, 4)
+                       .contiguous())
+                q, k, v = qkv.unbind(dim=0)
+            elif qkv_grid is not None:
+                qkv = (take(qkv_grid, start, end)
+                       .reshape(end - start, N, 3, self.num_heads, self.head_dim)
+                       .permute(2, 0, 3, 1, 4)
+                       .contiguous())
+                q, k, v = qkv.unbind(dim=0)
+            else:
+                q, k, v = self.qkv(gate_tokens)
+            if self.qk_norm:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+            if region_groups is not None:
+                attn = _sdpa_with_region_groups(q, k, v, *slice_groups(start, end))
+            elif pad_attn_mask is not None:
+                attn = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=pad_attn_mask[start:end],
+                    dropout_p=0.0, is_causal=False)
+            else:
+                attn = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=0.0, is_causal=False)
+            attn = self.attn_gate(gate_tokens, attn)
+            attn = attn.transpose(1, 2).reshape(end - start, N, C)
+            res = self.proj(attn).view(end - start, T, H_w, W_w, C)
+            del q, k, v, attn, gate_tokens
+            qkv = None
+            for i, idx in enumerate(range(start, end)):
+                b, h0, w0 = locate(idx)
+                hv, wv = min(H_w, H - h0), min(W_w, W - w0)
+                out[b, :, h0:h0 + hv, w0:w0 + wv, :] = res[i, :, :hv, :wv, :]
+            del res
         return out
 
 
@@ -1974,11 +2296,16 @@ class CSwinAttention2D(nn.Module):
         q_w = apply_rotary(q_w, cos_w, sin_w)
         k_w = apply_rotary(k_w, cos_w, sin_w)
 
-        # Attention along each axis.
-        attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
-                                                 dropout_p=0.0, is_causal=False)
-        attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
-                                                 dropout_p=0.0, is_causal=False)
+        # Independent strips can share the existing low-memory window limit.
+        strip_batch = int(getattr(self, 'inference_strip_batch', 0) or 0)
+        if strip_batch > 0 and not self.training:
+            attn_h = _window_attention_batched(q_h, k_h, v_h, window_batch=strip_batch)
+            attn_w = _window_attention_batched(q_w, k_w, v_w, window_batch=strip_batch)
+        else:
+            attn_h = F.scaled_dot_product_attention(q_h, k_h, v_h,
+                                                     dropout_p=0.0, is_causal=False)
+            attn_w = F.scaled_dot_product_attention(q_w, k_w, v_w,
+                                                     dropout_p=0.0, is_causal=False)
 
         # Un-strip back to (B, H, W, head_group, D) and concat heads.
         # H-group: (B·W, h_heads, H, D) → (B, W, h_heads, H, D) → (B, H, W, h_heads, D)
@@ -2042,6 +2369,10 @@ class CSwinAttention3D(nn.Module):
 
         if (strip_batch > 0 and not self.training and self.qkv_dw is None
                 and max(B * H, B * W) > strip_batch):
+            # Opt-in: drop each strip-path intermediate once it is consumed
+            # (the strip copies of x, the per-strip outputs and their
+            # permuted copies) instead of holding all of them to the return.
+            free = bool(getattr(self, 'inference_free_strips', False))
             cos_h, sin_h = self.rope.get_cos_sin(
                 T, H, 1, device=x.device, t_stride=t_stride)
             cos_w, sin_w = self.rope.get_cos_sin(
@@ -2062,9 +2393,13 @@ class CSwinAttention3D(nn.Module):
                 k = apply_rotary(k, cos_h, sin_h)
                 out_h[start:end] = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=0.0, is_causal=False)
+            if free:
+                del x_h, q, k, v
             attn_h = (out_h.reshape(B, W, h_heads, T, H, D)
                            .permute(0, 3, 4, 1, 2, 5)
                            .contiguous())
+            if free:
+                del out_h
 
             x_w = x.permute(0, 2, 1, 3, 4).reshape(B * H, T * W, C)
             out_w = x.new_empty((B * H, w_heads, T * W, D))
@@ -2081,11 +2416,17 @@ class CSwinAttention3D(nn.Module):
                 k = apply_rotary(k, cos_w, sin_w)
                 out_w[start:end] = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=0.0, is_causal=False)
+            if free:
+                del x_w, q, k, v
             attn_w = (out_w.reshape(B, H, w_heads, T, W, D)
                            .permute(0, 3, 1, 4, 2, 5)
                            .contiguous())
+            if free:
+                del out_w
 
             attn = torch.cat([attn_h, attn_w], dim=-2)
+            if free:
+                del attn_h, attn_w
             attn = attn * self.attn_gate.grid(x, dtype=attn.dtype)
             attn = attn.reshape(B, T, H, W, C)
             return self.proj(attn)
@@ -2444,13 +2785,20 @@ class FullSpatialAttention2D(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         gate_tokens = x.reshape(BT, N, C)
+        native_attention = None
+        if query_chunk > 0 and not self.training and N > query_chunk and x.device.type == 'mps':
+            from .mps_attention import prepare
+            native_attention = prepare(q, k, v)
         if query_chunk > 0 and not self.training and N > query_chunk:
             attn = q.new_empty((BT, self.num_heads, N, self.head_dim))
             for start in range(0, N, query_chunk):
                 end = min(start + query_chunk, N)
-                a = F.scaled_dot_product_attention(
-                    q[:, :, start:end], k, v,
-                    dropout_p=0.0, is_causal=False)
+                if native_attention is not None:
+                    a = native_attention(start, end)
+                else:
+                    a = F.scaled_dot_product_attention(
+                        q[:, :, start:end], k, v,
+                        dropout_p=0.0, is_causal=False)
                 a = self.attn_gate(gate_tokens[:, start:end], a)
                 attn[:, :, start:end] = a
         else:
@@ -2755,6 +3103,11 @@ class FullSpatialBlock3D(nn.Module):
     def _local_mix_frames(self, x: torch.Tensor) -> torch.Tensor:
         if self.local_mix is None:
             return x
+        frame_chunk = int(getattr(self, 'inference_local_mix_frame_chunk', 0) or 0)
+        if frame_chunk > 0 and not self.training:
+            return _chunked_local_mix(
+                self.local_mix, x, frame_chunk,
+                inplace=bool(getattr(self, 'inference_inplace_residual', False)))
         B, T, H, W, C = x.shape
         y = x.reshape(B * T, H, W, C)
         y = self.local_mix(y)
@@ -2844,6 +3197,11 @@ class SwinBlock3D(nn.Module):
     def _local_mix_frames(self, x: torch.Tensor) -> torch.Tensor:
         if self.local_mix is None:
             return x
+        frame_chunk = int(getattr(self, 'inference_local_mix_frame_chunk', 0) or 0)
+        if frame_chunk > 0 and not self.training:
+            return _chunked_local_mix(
+                self.local_mix, x, frame_chunk,
+                inplace=bool(getattr(self, 'inference_inplace_residual', False)))
         B, T, H, W, C = x.shape
         y = x.reshape(B * T, H, W, C)
         y = self.local_mix(y)
@@ -2867,6 +3225,7 @@ class SwinBlock3D(nn.Module):
         x = self.norm1(x)
         if shift1 is not None:
             x = x * (1.0 + scale1) + shift1
+        x = _bf16_branch_input(self, x)
         if sh or sw:
             T, H, W = x.shape[1], x.shape[2], x.shape[3]
             H_w, W_w = self.window_H, self.window_W
@@ -2882,7 +3241,7 @@ class SwinBlock3D(nn.Module):
             x = x[:, :, :H, :W, :].contiguous()
         else:
             x = self.attn(x, t_stride=t_stride)
-        x = shortcut + (x * gate1 if gate1 is not None else x)
+        x = _residual_add(self, shortcut, x * gate1 if gate1 is not None else x)
 
         x = self._local_mix_frames(x)
 
@@ -2890,8 +3249,9 @@ class SwinBlock3D(nn.Module):
         x = self.norm2(x)
         if shift2 is not None:
             x = x * (1.0 + scale2) + shift2
+        x = _bf16_branch_input(self, x)
         x = self.mlp(x)
-        x = shortcut + (x * gate2 if gate2 is not None else x)
+        x = _residual_add(self, shortcut, x * gate2 if gate2 is not None else x)
         return x
 
 
@@ -2953,6 +3313,11 @@ class CSwinBlock3D(nn.Module):
     def _local_mix_frames(self, x: torch.Tensor) -> torch.Tensor:
         if self.local_mix is None:
             return x
+        frame_chunk = int(getattr(self, 'inference_local_mix_frame_chunk', 0) or 0)
+        if frame_chunk > 0 and not self.training:
+            return _chunked_local_mix(
+                self.local_mix, x, frame_chunk,
+                inplace=bool(getattr(self, 'inference_inplace_residual', False)))
         B, T, H, W, C = x.shape
         y = x.reshape(B * T, H, W, C)
         y = self.local_mix(y)
@@ -2961,13 +3326,15 @@ class CSwinBlock3D(nn.Module):
     def forward(self, x: torch.Tensor, t_stride: float = 1.0) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
+        x = _bf16_branch_input(self, x)
         x = self.attn(x, t_stride=t_stride)
-        x = shortcut + x
+        x = _residual_add(self, shortcut, x)
         x = self._local_mix_frames(x)
         shortcut = x
         x = self.norm2(x)
+        x = _bf16_branch_input(self, x)
         x = self.mlp(x)
-        x = shortcut + x
+        x = _residual_add(self, shortcut, x)
         return x
 
 
@@ -3002,6 +3369,11 @@ class FullSpatioTemporalBlock(nn.Module):
     def _local_mix_frames(self, x: torch.Tensor) -> torch.Tensor:
         if self.local_mix is None:
             return x
+        frame_chunk = int(getattr(self, 'inference_local_mix_frame_chunk', 0) or 0)
+        if frame_chunk > 0 and not self.training:
+            return _chunked_local_mix(
+                self.local_mix, x, frame_chunk,
+                inplace=bool(getattr(self, 'inference_inplace_residual', False)))
         B, T, H, W, C = x.shape
         y = x.reshape(B * T, H, W, C)
         y = self.local_mix(y)
