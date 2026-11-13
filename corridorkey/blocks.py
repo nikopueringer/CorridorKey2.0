@@ -946,6 +946,10 @@ def _window_attention_batched(q, k, v, *, window_batch=0,
     for start in range(0, count, step):
         end = min(start + step, count)
         qs, ks, vs = q[start:end], k[start:end], v[start:end]
+        if q.device.type == "mps":
+            # Packed QKV leaves V with a non-contiguous batch stride. Keep
+            # Metal SDPA inputs dense, limiting copies to this window batch.
+            qs, ks, vs = qs.contiguous(), ks.contiguous(), vs.contiguous()
         if region_groups is not None:
             num_windows, full_idx, groups = region_groups
             if num_windows <= 0:
@@ -961,8 +965,11 @@ def _window_attention_batched(q, k, v, *, window_batch=0,
                 value = _sdpa_with_region_groups(
                     qs, ks, vs, end - start, rebase(full_idx), sliced)
         elif attn_mask is not None:
+            mask = attn_mask[start:end]
+            if q.device.type == "mps":
+                mask = mask.contiguous()
             value = F.scaled_dot_product_attention(
-                qs, ks, vs, attn_mask=attn_mask[start:end])
+                qs, ks, vs, attn_mask=mask)
         elif region_ids is not None:
             value = _sdpa_with_region_ids(qs, ks, vs, region_ids[start:end])
         else:
@@ -1172,7 +1179,14 @@ class SwinAttention2D(nn.Module):
         k = apply_rotary(k, cos, sin)
 
         window_batch = int(getattr(self, 'inference_window_batch', 0) or 0)
-        if window_batch > 0 and not self.training and nW_total > window_batch:
+        use_batched = not self.training and (
+            (window_batch > 0 and nW_total > window_batch)
+            or (x.device.type == 'mps' and attn_mask is not None
+                and region_groups is None))
+        if use_batched:
+            # Metal's masked SDPA requires the flattened 4D layout even for
+            # a single window. Keep that route bounded without a batch hint.
+            effective_batch = window_batch if window_batch > 0 else 1
             mask = None
             if attn_mask is not None:
                 nW = int(attn_mask.shape[0])
@@ -1187,7 +1201,7 @@ class SwinAttention2D(nn.Module):
                 mask = real.reshape(1, -1, N).expand(B, -1, -1)
                 mask = mask.reshape(nW_total, 1, 1, N)
             attn = _window_attention_batched(
-                q, k, v, window_batch=window_batch, attn_mask=mask,
+                q, k, v, window_batch=effective_batch, attn_mask=mask,
                 region_ids=region_ids, region_groups=region_groups)
         elif region_groups is not None:
             attn = _sdpa_with_region_groups(q, k, v, *region_groups)

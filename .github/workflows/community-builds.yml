@@ -67,6 +67,7 @@ jobs:
           PY="$APP/Contents/Resources/Python/bin/python3"
           SRC="$APP/Contents/Resources/src"
           "$PY" "$SRC/infer.py" --help
+          "$PY" "$SRC/scripts/diagnose_mps_attention.py" --output "$RUNNER_TEMP/mps-attention.json"
           uv pip install --python "$PY" --target "$RUNNER_TEMP/test-tools" pytest
           cd "$SRC"
           PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
@@ -93,7 +94,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macOS-launcher-log
-          path: ~/Library/Logs/CorridorKey2.0/
+          path: |
+            ~/Library/Logs/CorridorKey2.0/
+            ${{ runner.temp }}/mps-attention.json
           if-no-files-found: ignore
           retention-days: 7
 
