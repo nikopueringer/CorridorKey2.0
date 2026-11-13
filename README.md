@@ -1,3 +1,52 @@
+# CorridorKey 2.0 PLUS
+
+## Carrying the torch...
+
+At the time of this writing one full month since its original release, [nikopueringer/CorridorKey2.0](https://github.com/nikopueringer/CorridorKey2.0) has merged only 1 PR, and that PR contained only a name credit correction one day after the project was released. Several potentially useful PRs have accumulated in the mean time that have not merged yet, and I wanted to cherry-pick the best parts I've seen into a single _working_ branch.
+
+I have much love for Niko and the Corridor Crew, without whom none of this would be possible! :heart: But I know that maintaining an open source project can be, well, a whole second job, and they need to focus on making amazing VFX and sharing all the fun behind-the-scenes stories. That's why I'm just going to roll a bunch of updates into my own fork. Maybe some day this fork won't be necessary, but until then...
+
+I have both Apple Silicon based Macs (MPS) **_and_** Linux PCs with Nvidia GPUs (CUDA, etc) in my environment, and I want the best performance and reliability out of both. So, this fork's `plus` branch contains a selection of cherry-picked commits from several PRs against the original repo _plus_ many additional fixes to resolve conflicts, gate architecture-specific functionality (e.g. no CUDA on Macs), and generally smooth over some rough edges. Full author credit is retained in each of the commits I cherry-picked.
+
+Notable PRs that I've picked include:
+
+- [#15: Add Apple Silicon inference with bounded memory use](https://github.com/nikopueringer/CorridorKey2.0/pull/15) by **[jslinker](https://github.com/jslinker)**
+  - The foundation of this fork's macOS support: MPS device selection, Metal memory controls, and native 4K validation. Extended with an MPS budget fix (`_MPS_ESTIMATE_SCALE`) to prevent OOM when the auto-VRAM picker over-estimates available memory, and a frame-count probe fix (`_probe_frame_count` via ffprobe) for MP4s whose container metadata disagrees with the actual encoded duration.
+- [#20: Preprocess 8-bit frames ~17× faster with a lookup table](https://github.com/nikopueringer/CorridorKey2.0/pull/20) by **[MrFruitDude](https://github.com/MrFruitDude)**
+  - Builds a 256-entry bfloat16 LUT so that video and sRGB PNG/JPEG frames skip per-pixel float math entirely; output is bit-identical.
+- [#18: Add opt-in `--optimized`: byte-identical output in less memory and time](https://github.com/nikopueringer/CorridorKey2.0/pull/18) by **[adityakamat24](https://github.com/adityakamat24)**
+  - Adds `--optimized` / `--fast` flags enabling bf16 weights, lean activations, prefetch frames, decode-once, async baton, and more. Required significant conflict resolution and MPS-specific gating: `activation_arena`, `pinned_io`, `async_baton`, and `decode_once` are disabled or guarded for unified-memory systems where CUDA-specific allocator tricks don't apply; all `torch.autocast("cuda", ...)` calls were updated to be device-type-aware.
+- [#4: Fix image-sequence frame order and case-insensitive extensions](https://github.com/nikopueringer/CorridorKey2.0/pull/4) by **[Davidhanson90](https://github.com/Davidhanson90)**
+  - Natural sort so `frame_2.png` sorts before `frame_10.png` on Linux, and `.PNG`/`.EXR` extensions are no longer silently skipped.
+- [#6: Keep RMSNorm output dtype under autocast on newer torch](https://github.com/nikopueringer/CorridorKey2.0/pull/6) by **[KyleJFischer](https://github.com/KyleJFischer)**
+  - Newer PyTorch releases promote `F.rms_norm` output to float32 under bf16 autocast, breaking downstream ops with a dtype mismatch. The fix casts the norm output back to the input dtype, a no-op on torch 2.9.1 and a correctness fix on 2.14+.
+- [#9: Reduce inference VRAM with bit-identical output](https://github.com/nikopueringer/CorridorKey2.0/pull/9) by **[Reinbowl](https://github.com/Reinbowl)**
+  - Stores all Linear and Conv weights as bfloat16 and disables `requires_grad` unconditionally at model load, halving resident weight memory for all users on all hardware.
+- [#11: Fix auto-VRAM OOM on first run](https://github.com/nikopueringer/CorridorKey2.0/pull/11) by **[levi-lumin](https://github.com/levi-lumin)**
+  - Replaces the fixed 0.3 GB VRAM margin with `max(1.5 GB, 5 % of total VRAM)`, samples the budget twice with a one-second gap to avoid transient spikes, reports the remaining margin in the log line, and adds an automatic OOM retry (CUDA only) that falls back to a smaller chunk rather than crashing.
+
+Locally tested using a short 1080p video from a cheap USB webcam (featuring me talking in front of an unevently-lit green screen) and a manually edited first-frame alpha hint:
+
+```
+time uv run corridorkey \
+  --input /tmp/clip-10sec.mp4 \
+  --hint_first_frame /tmp/clip-10secFrameHint.png \
+  --hint_quality 0.95 --carry_hint_quality 0.95 \
+  --despill_strength 0.8 \
+  --num_frames 120 --start_mode begin \
+  --output_dir /tmp/ck-output-test \
+  --outputs alpha fg checker \
+  --fast
+```
+
+I confirmed that both Linux and Mac systems produced excellent and visually imperceptible outputs:
+
+- Linux PC with RTX 5070 Ti (16 GB) and 96 GB of RAM: `real 1m2.413s`
+- Apple M4 Pro with 48 GB of unified memory: `real 5m53.890s`
+
+Disclaimer: I don't have any Windows PCs to test on, but I don't *see* anything introduced in this branch that seems like it would break Windows compatibility, assuming it worked in the first place.
+
+
 # CorridorKey 2.0
 
 ## Full macOS support on Apple Silicon
