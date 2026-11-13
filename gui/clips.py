@@ -5,12 +5,11 @@ a clip dropped on the window picks up the same hints the wizard would find.
 """
 from __future__ import annotations
 
-import glob
-import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from corridorkey.outputs import OUTPUT_SUFFIXES, default_output_dir, read_outputs
 
 from run_interactive import (
     check_image_sequence_dir,
@@ -29,16 +28,6 @@ HINT_VIDEO = "video"
 
 QUEUED, RUNNING, DONE, FAILED, STOPPED = "Queued", "Running", "Done", "Failed", "Stopped"
 
-# Names written by corridorkey.runtime.run_inference: <clip>_<suffix>.mp4/.mov,
-# or a <clip>_<suffix>_exr folder for EXR output.
-OUTPUT_SUFFIXES = {
-    "alpha": "alpha",
-    "fg": "fg",
-    "checker": "checker_comp_despill*",
-    "cutout": "cutout",
-}
-
-
 @dataclass(eq=False)
 class Clip:
     # path is what was added (a video, a frame folder or an Input/AlphaHint
@@ -52,6 +41,7 @@ class Clip:
     status: str = QUEUED
     progress: float = 0.0
     detail: str = ""
+    timing_summary: str = ""
     output_dir: Path | None = None  # where the last run wrote
 
     @property
@@ -116,32 +106,11 @@ def _video_clip(path: Path) -> Clip:
 
 
 def output_dir_for(clip: Clip, output_parent: str = "") -> Path:
-    """out_<name> next to the clip, or inside output_parent, as the wizard does."""
+    """Stable source-specific destination, independent of queue order."""
     parent = Path(output_parent) if output_parent else clip.path.parent
-    return parent / f"out_{clip.path.stem}"
+    return default_output_dir(clip.source, parent=parent, display_name=clip.path.stem)
 
 
 def find_outputs(clip: Clip, output_dir: Path) -> dict[str, Path]:
-    """The newest video or EXR folder for each output the clip has in output_dir."""
-    found = {}
-    if not output_dir.is_dir():
-        return found
-    try:
-        saved = json.loads((output_dir / f"{clip.name}_color.json").read_text()).get("outputs", {})
-        if not isinstance(saved, dict):
-            saved = {}
-    except (OSError, ValueError, TypeError, AttributeError):
-        saved = {}
-    stem = glob.escape(clip.name)
-    for key, suffix in OUTPUT_SUFFIXES.items():
-        candidates = [p for p in output_dir.glob(f"{stem}_{suffix}.*")
-                      if p.suffix.lower() in (".mp4", ".mov")]
-        candidates += [p for p in output_dir.glob(f"{stem}_{suffix}_exr") if p.is_dir()]
-        if candidates:
-            entry = saved.get(key, {})
-            recorded = entry.get("path") if isinstance(entry, dict) else None
-            # Only choose from the discovered output names. A sidecar cannot
-            # redirect the viewer outside this clip's output directory.
-            completed = next((p for p in candidates if p.name == recorded), None)
-            found[key] = completed or max(candidates, key=lambda p: p.stat().st_mtime)
-    return found
+    """Only completed generations, or flat outputs from older versions."""
+    return read_outputs(output_dir, clip.source, clip.name)

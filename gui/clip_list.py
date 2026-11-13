@@ -24,6 +24,15 @@ CLIP_ROLE = Qt.ItemDataRole.UserRole
 STATUS_COLUMN = 2
 
 
+def _timing_line(timing: str) -> str:
+    parts = timing.split(" · ")
+    total = next((part.removeprefix("total ") for part in parts
+                  if part.startswith("total ")), "")
+    keying = next((part.removeprefix("keying ") for part in parts
+                   if part.startswith("keying ")), "")
+    return f"Key {keying} · Total {total}" if keying and total else " · ".join(parts[1:])
+
+
 class _StatusDelegate(QStyledItemDelegate):
     """The status cell: a pill per state, like the app's READY badge, and the
     running phase over a thin brand-yellow bar."""
@@ -35,7 +44,8 @@ class _StatusDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         size = super().sizeHint(option, index)
-        return QSize(size.width(), size.height() + 10)  # sets the row height for every column
+        # All rows reserve the timing line because the tree uses uniform heights.
+        return QSize(size.width(), size.height() + 18)
 
     def paint(self, painter, option, index):
         clip = index.siblingAtColumn(0).data(CLIP_ROLE)
@@ -57,23 +67,51 @@ class _StatusDelegate(QStyledItemDelegate):
                              QColor(BRAND))
             painter.setPen(QColor(TEXT))
             painter.setFont(self._detail_font)
+            phase, *details = clip.detail.split(" · ")
             text = QFontMetricsF(self._detail_font).elidedText(
-                clip.detail, Qt.TextElideMode.ElideRight, rect.width())
-            painter.drawText(rect.adjusted(0, 0, 0, -5),
+                phase, Qt.TextElideMode.ElideRight, rect.width())
+            line_height = (rect.height() - 5) / 2
+            painter.drawText(QRectF(rect.left(), rect.top(), rect.width(), line_height),
                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            timing = " · ".join(part for part in details
+                                if part.endswith((" elapsed", " left")) or part == "ETA updating")
+            detail_font = font(10)
+            painter.setFont(detail_font)
+            painter.setPen(QColor(MUTED))
+            timing = QFontMetricsF(detail_font).elidedText(
+                timing, Qt.TextElideMode.ElideRight, rect.width())
+            painter.drawText(QRectF(rect.left(), rect.top() + line_height,
+                                    rect.width(), line_height),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, timing)
         else:
             colour, outline = STATUS_PILLS.get(clip.status, (MUTED, LINE_STRONG))
             label = clip.status.upper()
             metrics = QFontMetricsF(self._pill_font)
             height = metrics.height() + 4
-            pill = QRectF(rect.left(), rect.center().y() - height / 2,
-                          metrics.horizontalAdvance(label) + 16, height)
+            timing = getattr(clip, "timing_summary", "")
+            if timing:
+                label_height = height
+                pill = QRectF(rect.left(), rect.top() + 1,
+                              metrics.horizontalAdvance(label) + 16, label_height)
+            else:
+                pill = QRectF(rect.left(), rect.center().y() - height / 2,
+                              metrics.horizontalAdvance(label) + 16, height)
             painter.setPen(QPen(QColor(outline), 1))
             painter.setBrush(QColor(CANVAS))
             painter.drawRoundedRect(pill.adjusted(0.5, 0.5, -0.5, -0.5), height / 2, height / 2)
             painter.setPen(QColor(colour))
             painter.setFont(self._pill_font)
             painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
+            if timing:
+                detail_font = font(10)
+                painter.setPen(QColor(MUTED))
+                painter.setFont(detail_font)
+                summary = _timing_line(timing)
+                summary = QFontMetricsF(detail_font).elidedText(
+                    summary, Qt.TextElideMode.ElideRight, rect.width())
+                painter.drawText(rect.adjusted(0, height + 1, 0, 0),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                 summary)
         painter.restore()
 
 
@@ -95,7 +133,7 @@ class ClipList(QTreeWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(STATUS_COLUMN, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(1, 64)
-        self.setColumnWidth(STATUS_COLUMN, 132)
+        self.setColumnWidth(STATUS_COLUMN, 152)
         self.setItemDelegateForColumn(STATUS_COLUMN, _StatusDelegate(self))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
@@ -136,7 +174,11 @@ class ClipList(QTreeWidget):
         item.setText(1, clip.hint_label)
         item.setToolTip(1, str(clip.hint_path) if clip.hint_path else "No hint")
         item.setText(STATUS_COLUMN, clip.status)
-        item.setToolTip(STATUS_COLUMN, clip.detail or clip.status)
+        timing = getattr(clip, "timing_summary", "")
+        tooltip = clip.detail or clip.status
+        if timing:
+            tooltip = f"{tooltip}\n{timing}"
+        item.setToolTip(STATUS_COLUMN, tooltip)
 
     def select(self, clip: Clip) -> None:
         if clip in self._items:

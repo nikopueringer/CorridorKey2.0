@@ -26,6 +26,15 @@ from the official paid plugin. An Apple Silicon desktop app with bundled Python
 and the reviewed MPS backend is also available: [Mac build and usage](packaging/macos/README.md).
 See the [review of all upstream pull requests](docs/PR_REVIEW.md) for integration decisions.
 
+The desktop queue shows live elapsed processing time and phase-specific estimates
+after enough completed work is available. Completion records total and keying time
+per clip, plus the queue's total time. Low-VRAM stage-two inference has its own
+progress; finishing the encoder does not display an unsupported ETA.
+
+Render results are published as complete generations: cancellation and write errors
+preserve the last successful output. New source-specific output folder names avoid
+collisions between identically named clips. See [output storage and compatibility](docs/CAMERA_COLOR.md).
+
 ## Setup
 
 ### Apple Silicon Mac

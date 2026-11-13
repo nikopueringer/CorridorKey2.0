@@ -255,9 +255,10 @@ class SettingsPanel(QScrollArea):
         select(self.vram_mode, "auto" if s.auto_vram else "manual")
         self.low_vram.setChecked(s.low_vram)
         self.chunk.setValue(s.hann_chunk)
+        self.stride.setMaximum(self.chunk.value())
         self.stride.setValue(s.hann_stride)
-        select(self.window, f"{s.hann_chunk}/{s.hann_stride}")
-        if self.window.currentData() != f"{s.hann_chunk}/{s.hann_stride}":
+        select(self.window, f"{self.chunk.value()}/{self.stride.value()}")
+        if self.window.currentData() != f"{self.chunk.value()}/{self.stride.value()}":
             select(self.window, "custom")
         self.temp_dir.setText("" if s.temp_dir == DEFAULT_TEMP_DIR else s.temp_dir)
         self.num_frames.setValue(s.num_frames)
@@ -311,6 +312,8 @@ class SettingsPanel(QScrollArea):
             chunk, stride = (int(v) for v in preset.split("/"))
             for spin, value in ((self.chunk, chunk), (self.stride, stride)):
                 spin.blockSignals(True)
+                if spin is self.stride:
+                    spin.setMaximum(chunk)
                 spin.setValue(value)
                 spin.blockSignals(False)
         self._on_change()
@@ -318,6 +321,9 @@ class SettingsPanel(QScrollArea):
     def _on_window_spin(self) -> None:
         if self._loading:
             return
+        self.stride.blockSignals(True)
+        self.stride.setMaximum(self.chunk.value())
+        self.stride.blockSignals(False)
         self.window.blockSignals(True)
         select(self.window, f"{self.chunk.value()}/{self.stride.value()}")
         if self.window.currentData() != f"{self.chunk.value()}/{self.stride.value()}":

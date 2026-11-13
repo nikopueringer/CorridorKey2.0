@@ -1,9 +1,9 @@
 """Frame viewer: the selected clip's input or any of its outputs, with a scrubber."""
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
+from corridorkey.outputs import output_metadata
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QShortcut
@@ -242,6 +242,8 @@ class ViewerPanel(QWidget):
         self._timer.timeout.connect(self._tick)
         loader.loaded.connect(self._on_loaded)
         loader.failed.connect(self._on_failed)
+        if hasattr(loader, "count_corrected"):
+            loader.count_corrected.connect(self._on_count_corrected)
         self.image.zoom_changed.connect(self._show_zoom)
         for key, slot in (("Space", self.toggle_play), ("Left", lambda: self.step(-1)),
                           ("Right", lambda: self.step(1)), ("F", self.image.fit)):
@@ -251,7 +253,8 @@ class ViewerPanel(QWidget):
         self.stop()
         self.set_clip(None, {})
 
-    def set_clip(self, clip: Clip | None, outputs: dict[str, Path]) -> None:
+    def set_clip(self, clip: Clip | None, outputs: dict[str, Path],
+                 output_root: Path | None = None) -> None:
         """Show a clip. Calling it again for the same clip refreshes its outputs
         and keeps the frame and view."""
         if clip is not self._clip:
@@ -265,24 +268,12 @@ class ViewerPanel(QWidget):
         self._output_fps = {}
         self._manifest_native_fps = None
         if clip and outputs:
-            sidecar = next(iter(outputs.values())).parent / f"{clip.name}_color.json"
-            try:
-                metadata = json.loads(sidecar.read_text(encoding="utf-8"))
-                self._output_profiles = {
-                    key: value["profile"] for key, value in metadata.get("outputs", {}).items()
-                    if key in outputs and isinstance(value, dict) and value.get("profile")
-                    and value.get("path", outputs[key].name) == outputs[key].name
-                }
-                self._output_fps = {
-                    key: _positive_fps(value.get("native_fps"))
-                    for key, value in metadata.get("outputs", {}).items()
-                    if key in self._output_profiles and isinstance(value, dict)
-                }
-                self._manifest_native_fps = _positive_fps(metadata.get("native_fps"))
-            except (OSError, ValueError, TypeError, AttributeError):
-                # Older outputs have no color manifest; retain their historical
-                # EXR-linear / video-sRGB interpretation.
-                self._output_profiles = {}
+            metadata, entries = output_metadata(clip.name, outputs, output_root)
+            self._output_profiles = {
+                key: value["profile"] for key, value in entries.items() if value.get("profile")}
+            self._output_fps = {
+                key: _positive_fps(value.get("native_fps")) for key, value in entries.items()}
+            self._manifest_native_fps = _positive_fps(metadata.get("native_fps"))
         for button in self.tabs.buttons():
             key = button.property("view")
             button.setEnabled(key in self._paths)
@@ -400,7 +391,10 @@ class ViewerPanel(QWidget):
         if not self._current(path):
             return
         self._waiting = False
+        fps_changed = fps != self._fps
         self._index, self._count, self._fps = index, count, fps
+        if self._timer.isActive() and fps_changed:
+            self._timer.start(max(1, round(1000 / (self._fps or 24.0))))
         if self._clip is not None and path == str(self._clip.source) and not self._clip.is_frames:
             self._input_fps = _positive_fps(fps)
         self.slider.blockSignals(True)
@@ -413,6 +407,23 @@ class ViewerPanel(QWidget):
         self.metadata_label.setText(f"{image.width()} × {image.height()} · {fps:g} fps · "
                                     f"{count} frames · {duration:.2f} s")
         self.image.set_image(image)
+
+    def _on_count_corrected(self, path: str, count: int) -> None:
+        if not self._current(path) or count <= 0:
+            return
+        self._count = count
+        self._index = min(self._index, count - 1)
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, count - 1)
+        self.slider.setValue(self._index)
+        self.slider.blockSignals(False)
+        self.frame_label.setText(f"<span style='color:{TEXT}; font-weight:600'>{self._index + 1}</span>"
+                                 f" / {count}")
+        if self.image.has_image() and self._fps > 0:
+            image = self.image._image
+            duration = count / self._fps
+            self.metadata_label.setText(f"{image.width()} × {image.height()} · {self._fps:g} fps · "
+                                        f"{count} frames · {duration:.2f} s")
 
     def _on_failed(self, path: str, message: str) -> None:
         if not self._current(path):

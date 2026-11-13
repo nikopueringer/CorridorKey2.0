@@ -14,10 +14,14 @@ concurrency:
 
 jobs:
   macos-app:
-    name: Apple Silicon app and OFX
-    # The macos-15 arm64 pool repeatedly failed to allocate a runner. Build on
-    # the current standard arm64 image while retaining the macOS 15 target.
-    runs-on: macos-26
+    name: Apple Silicon app and OFX (${{ matrix.os }})
+    # Exercise the minimum OS as well as the current one. Independent jobs
+    # also allow either standard arm64 pool to progress during capacity limits.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -68,24 +72,21 @@ jobs:
           SRC="$APP/Contents/Resources/src"
           "$PY" "$SRC/infer.py" --help
           "$PY" "$SRC/scripts/diagnose_mps_attention.py" --output "$RUNNER_TEMP/mps-attention.json"
+          "$PY" -c 'import platform, torch; assert platform.machine() == "arm64"; assert torch.backends.mps.is_available(), "Metal is required for release verification"'
           uv pip install --python "$PY" --target "$RUNNER_TEMP/test-tools" pytest
           cd "$SRC"
-          PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
-            tests/test_device.py tests/test_window_batching.py tests/test_mps_attention.py \
-            tests/test_frame_paths.py tests/test_preprocess_lut.py tests/test_asset_paths.py tests/test_linux_gui.py \
-            tests/test_ofx_protocol.py tests/test_ofx_worker.py tests/test_ofx_memory.py tests/test_media_probe.py \
-            tests/test_camera_color_gui.py tests/test_camera_video_runtime.py tests/test_camera_color_review.py
+          PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q tests
       - name: Upload Apple Silicon build
         uses: actions/upload-artifact@v4
         with:
-          name: CorridorKey-macOS-arm64
+          name: CorridorKey-macOS-arm64-${{ matrix.os }}
           path: dist/CorridorKey-macOS-arm64.zip
           if-no-files-found: error
           retention-days: 30
       - name: Upload Apple Silicon OFX plugin
         uses: actions/upload-artifact@v4
         with:
-          name: CorridorKeyMacOS-ofx-arm64
+          name: CorridorKeyMacOS-ofx-arm64-${{ matrix.os }}
           path: dist/CorridorKeyMacOS-OFX-arm64.zip
           if-no-files-found: error
           retention-days: 30
@@ -93,7 +94,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-launcher-log
+          name: macOS-launcher-log-${{ matrix.os }}
           path: |
             ~/Library/Logs/CorridorKey2.0/
             ${{ runner.temp }}/mps-attention.json

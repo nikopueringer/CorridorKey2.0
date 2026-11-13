@@ -92,10 +92,11 @@ class Engine:
                                self.model.stage1, self.model.stage2):
                     if module is not None:
                         hooks.append(module.register_forward_pre_hook(check_cancel))
-                run_inference(self.model, str(source), str(root / "output"), cfg, WriterConfig(),
-                              initial_hint_path=None, hint_video_path=None)
+                outputs = run_inference(
+                    self.model, str(source), str(root / "output"), cfg, WriterConfig(),
+                    initial_hint_path=None, hint_video_path=None)
                 check_cancel()
-                files = list((root / "output").glob("*_cutout_exr/cutout_*.exr"))
+                files = list(outputs["cutout"].glob("cutout_*.exr"))
                 if len(files) != 1:
                     raise RuntimeError("Expected exactly one keyed EXR from the engine")
                 result = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)

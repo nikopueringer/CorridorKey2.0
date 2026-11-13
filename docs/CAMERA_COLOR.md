@@ -54,10 +54,24 @@ Checker previews are display previews, not camera-log deliverables.
 Float EXR is the fidelity option for source-colour outputs. Half EXR and video
 encoding reduce precision; ProRes is lossy. Source-colour EXR is explicitly
 encoded in the selected camera profile, unlike the default linear EXR output.
-The colour sidecar next to a render records each output's interpretation; keep
-it with the files so the viewer can display old results using their saved
-profile, even after the clip's current selection changes. Set the same input
+The colour sidecar in the output root records each output's generation-relative
+path, interpretation, frame count and FPS. Keep the output root together so the
+viewer can display old results using their saved profile, even after the clip's
+current selection changes. Set the same input
 colour space explicitly when importing source-colour outputs into another app.
+
+Each successful run writes a new directory under `renders/` and publishes all
+selected outputs together by atomically updating that sidecar. Cancelled or
+failed work does not replace the previous result. Rerendering only Alpha keeps
+the last completed Cutout and its own profile/FPS. Previous completed generations
+are retained; they are not automatically deleted while another app may use them.
+Interrupted runs may leave hidden `.staging/` directories, which the viewer ignores.
+
+New desktop output folders include a stable source identifier, so two files named
+`shot.mov` or `shot.mov` and `shot.mp4` cannot overwrite each other's results.
+Older flat output folders remain readable. The CLI keeps the exact supplied
+`--output_dir`, but requires an empty directory or one already owned by the same
+source; choose a new directory for an older unowned render.
 
 ## Profiles and references
 

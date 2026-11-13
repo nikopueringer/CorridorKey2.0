@@ -33,6 +33,66 @@ class WriterConfig:
     threads: int = 2
 
 
+class _QueuedWriter:
+    """Queue helpers shared by asynchronous video and EXR writers."""
+
+    def _init_queue(self, maxsize: int):
+        if int(maxsize) < 1:
+            raise ValueError(f"writer queue maxsize must be >= 1, got {maxsize}")
+        self.q = queue.Queue(maxsize=int(maxsize))
+        self.err: Exception | None = None
+        self._submit_lock = threading.Lock()
+        self._release_lock = threading.Lock()
+        self._closing = False
+        self._released = False
+
+    def _record_error(self, exc: Exception):
+        if self.err is None:
+            self.err = exc
+
+    def _enqueue(self, item, *, internal: bool = False):
+        while True:
+            if self.err is not None:
+                raise self.err
+            if self._closing and not internal:
+                raise RuntimeError("writer is closing")
+            if not self.thread.is_alive():
+                if self.err is not None:
+                    raise self.err
+                raise RuntimeError("writer worker stopped before accepting queued data")
+            try:
+                self.q.put(item, timeout=0.05)
+                # A worker may fail and free a queue slot between our poll and
+                # this put. Do not report success for an item accepted only
+                # because a failed worker began draining its pending queue.
+                if self.err is not None:
+                    self._drain_pending()
+                    raise self.err
+                if self._closing and not internal:
+                    self._drain_pending()
+                    raise RuntimeError("writer is closing")
+                if not internal and not self.thread.is_alive():
+                    if self.err is not None:
+                        self._drain_pending()
+                        raise self.err
+                    self._drain_pending()
+                    raise RuntimeError("writer worker stopped while accepting queued data")
+                return
+            except queue.Full:
+                # Recheck worker state on every timeout. In particular, never
+                # strand a producer behind a full queue after worker failure.
+                continue
+
+    def _drain_pending(self):
+        while True:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self.q.task_done()
+
+
 def require_ffmpeg(ffmpeg_bin: str) -> None:
     if shutil.which(ffmpeg_bin) is None:
         raise FileNotFoundError(
@@ -723,10 +783,16 @@ class SequentialHintFrameDirWindowReader:
         self.hint_dir_path = hint_dir_path
         self.meta = meta
         self.paths = frame_paths(hint_dir_path)
-        if len(self.paths) < int(meta["num_frames"]):
+        self.start_frame = int(meta.get("start_frame", 0))
+        self.n_frames = int(meta["num_frames"])
+        if self.start_frame < 0 or self.n_frames < 0:
+            raise ValueError("hint start_frame and num_frames must be non-negative")
+        required = self.start_frame + self.n_frames
+        if len(self.paths) < required:
             raise RuntimeError(
-                f"{hint_dir_path}: only {len(self.paths)} hint frames for "
-                f"{meta['num_frames']} source frames")
+                f"{hint_dir_path}: only {len(self.paths)} hint frames; "
+                f"need {required} for start={self.start_frame}, "
+                f"num_frames={self.n_frames}")
         self.next_t = 0
         self.cache: dict[int, torch.Tensor] = {}
 
@@ -734,12 +800,21 @@ class SequentialHintFrameDirWindowReader:
         pass
 
     def _read_until(self, t_end: int):
+        if t_end < 0 or t_end > self.n_frames:
+            raise ValueError(
+                f"hint window end {t_end} is outside [0, {self.n_frames}]")
         while self.next_t < t_end:
-            frame = cv2.imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
+            path = self.paths[self.start_frame + self.next_t]
+            frame = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                raise RuntimeError(f"{path}: failed decoding hint frame")
             self.cache[self.next_t] = preprocess_hint_frame(frame, self.meta)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
+        if t0 < 0 or t1 < t0 or t1 > self.n_frames:
+            raise ValueError(
+                f"hint window [{t0}, {t1}) is outside [0, {self.n_frames}]")
         self._read_until(t1)
         hint = torch.stack([self.cache[t] for t in range(t0, t1)])
         for old_t in [k for k in self.cache if k < t0]:
@@ -757,12 +832,24 @@ def make_hint_reader(path: str | None, meta: dict):
 
 
 def window_starts(T_all: int, chunk: int, stride: int) -> list[int]:
+    T_all, chunk, stride = int(T_all), int(chunk), int(stride)
+    if T_all < 0:
+        raise ValueError(f"frame count must be non-negative, got {T_all}")
+    validate_hann_window(chunk, stride)
     if T_all <= chunk:
         return [0]
     starts = list(range(0, T_all - chunk + 1, stride))
     if starts[-1] != T_all - chunk:
         starts.append(T_all - chunk)
     return starts
+
+
+def validate_hann_window(chunk: int, stride: int) -> None:
+    """Reject invalid temporal window settings before inference starts."""
+    if chunk < 1:
+        raise ValueError(f"chunk must be >= 1, got {chunk}")
+    if stride < 1 or stride > chunk:
+        raise ValueError(f"stride must satisfy 1 <= stride <= chunk, got {stride} for chunk {chunk}")
 
 
 def taper_weights(Tc: int, overlap: int, *, is_first: bool, is_last: bool,
@@ -781,7 +868,7 @@ def taper_weights(Tc: int, overlap: int, *, is_first: bool, is_last: bool,
     return w
 
 
-class ThreadedVideoWriter:
+class ThreadedVideoWriter(_QueuedWriter):
     def __init__(self, path: str, fps: float, size: tuple[int, int],
                  cfg: WriterConfig, *, maxsize: int = 2, channels: int = 3,
                  color_trc: str | None = None, tag_color: bool = True):
@@ -794,8 +881,8 @@ class ThreadedVideoWriter:
         self.color_trc = color_trc
         self.tag_color = bool(tag_color)
         self.proc = None
-        self.q = queue.Queue(maxsize=maxsize)
-        self.err = None
+        self.written_frames = 0
+        self._init_queue(maxsize)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self._start()
 
@@ -836,6 +923,10 @@ class ThreadedVideoWriter:
         cmd.extend(["-colorspace", "bt709"])
         if self.tag_color:
             trc = self.color_trc if self.color_trc is not None else "iec61966-2-1"
+            # Set frame-level properties as well as stream/container tags.
+            # ProRes MOV writers otherwise emit the transfer tag in `colr`
+            # while leaving the encoded frame properties unspecified.
+            cmd.extend(["-vf", f"setparams=color_primaries=bt709:color_trc={trc}"])
             cmd.extend(["-color_primaries", "bt709", "-color_trc", trc,
                         "-movflags", "+write_colr"])
         cmd.append(self.path)
@@ -847,41 +938,93 @@ class ThreadedVideoWriter:
         try:
             while True:
                 item = self.q.get()
-                if item is None:
+                try:
+                    if item is None:
+                        return
+                    self.proc.stdin.write(item.tobytes())
+                    self.written_frames += item.shape[0]
+                finally:
                     self.q.task_done()
-                    return
-                self.proc.stdin.write(item.tobytes())
-                self.q.task_done()
         except Exception as exc:
-            self.err = exc
+            self._record_error(exc)
+        finally:
+            # A failed worker must release every queue slot so blocked callers
+            # can wake, observe the failure, and return.
+            self._drain_pending()
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
     def write_many(self, frames: np.ndarray):
-        if self.err is not None:
-            raise self.err
         arr = np.ascontiguousarray(frames)
         if arr.ndim != 4 or arr.shape[-1] != self.channels:
             raise ValueError(
                 f"expected batched frames as NHWC uint16 with {self.channels} channels, got {arr.shape}")
         if arr.dtype != np.uint16:
             raise ValueError(f"expected uint16 frames, got {arr.dtype}")
-        self.q.put(arr)
+        with self._submit_lock:
+            self._enqueue(arr)
 
-    def release(self):
-        self.q.put(None)
-        self.thread.join()
-        if self.proc is not None and self.proc.stdin is not None:
-            self.proc.stdin.close()
-        rc = self.proc.wait() if self.proc is not None else 0
-        if rc != 0 and self.err is None:
-            self.err = RuntimeError(f"ffmpeg writer failed with exit code {rc}: {self.path}")
-        if self.err is not None:
-            raise self.err
+    def release(self, abort: bool = False):
+        with self._release_lock:
+            if self._released:
+                if self.err is not None:
+                    raise self.err
+                return
+            if abort:
+                # Fence blocked submitters before waiting for their submit lock;
+                # their bounded put loop will observe _closing and return.
+                self._closing = True
+                with self._submit_lock:
+                    pass
+                if self.proc is not None and self.proc.poll() is None:
+                    try:
+                        self.proc.terminate()
+                    except OSError as exc:
+                        if self.proc.poll() is None:
+                            self._record_error(exc)
+                    if self.proc.poll() is None:
+                        try:
+                            self.proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.proc.kill()
+                            self.proc.wait()
+                self._drain_pending()
+            else:
+                with self._submit_lock:
+                    self._closing = True
+            if self.thread.is_alive():
+                try:
+                    self._enqueue(None, internal=True)
+                except Exception as exc:
+                    self._record_error(exc)
+            # Successful close deliberately has no wall-clock cutoff: accepted
+            # writes must drain before the encoder receives EOF.
+            self.thread.join()
+            if self.proc is not None:
+                if self.proc.stdin is not None and not self.proc.stdin.closed:
+                    try:
+                        self.proc.stdin.close()
+                    except Exception as exc:
+                        self._record_error(exc)
+                if self.err is not None and self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait()
+                else:
+                    rc = self.proc.wait()
+                    if rc != 0:
+                        self._record_error(RuntimeError(
+                            f"ffmpeg writer failed with exit code {rc}: {self.path}"))
+            self._released = True
+            if self.err is not None:
+                raise self.err
 
 
-class ExrSequenceWriter:
+class ExrSequenceWriter(_QueuedWriter):
     """Writes float frames as an OpenEXR image sequence (scene-referred, unclamped).
 
     Accepts NHWC float32 batches with `channels` channels in BGR(A) order,
@@ -909,8 +1052,8 @@ class ExrSequenceWriter:
         ]
         os.makedirs(self.dir_path, exist_ok=True)
         self.frame_idx = 0
-        self.q = queue.Queue(maxsize=maxsize)
-        self.err = None
+        self.written_frames = 0
+        self._init_queue(maxsize)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -918,28 +1061,30 @@ class ExrSequenceWriter:
         try:
             while True:
                 item = self.q.get()
-                if item is None:
+                try:
+                    if item is None:
+                        return
+                    idx0, arr = item
+                    if self.clamp_half:
+                        # float16 overflows to inf above 65504; keep half EXRs finite
+                        arr = np.clip(arr, -65504.0, 65504.0)
+                    for j in range(arr.shape[0]):
+                        out_path = os.path.join(
+                            self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
+                        frame = np.ascontiguousarray(arr[j])
+                        if frame.shape[-1] == 1:
+                            frame = frame[..., 0]
+                        if not cv2.imwrite(out_path, frame, self.imwrite_params):
+                            raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+                        self.written_frames += 1
+                finally:
                     self.q.task_done()
-                    return
-                idx0, arr = item
-                if self.clamp_half:
-                    # float16 overflows to inf above 65504; keep half EXRs finite
-                    arr = np.clip(arr, -65504.0, 65504.0)
-                for j in range(arr.shape[0]):
-                    out_path = os.path.join(
-                        self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
-                    frame = np.ascontiguousarray(arr[j])
-                    if frame.shape[-1] == 1:
-                        frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
-                self.q.task_done()
         except Exception as exc:
-            self.err = exc
+            self._record_error(exc)
+        finally:
+            self._drain_pending()
 
     def write_many(self, frames: np.ndarray):
-        if self.err is not None:
-            raise self.err
         arr = np.ascontiguousarray(frames)
         if arr.ndim != 4 or arr.shape[-1] != self.channels:
             raise ValueError(
@@ -947,17 +1092,39 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
-        self.q.put((self.frame_idx, arr))
-        self.frame_idx += arr.shape[0]
+        with self._submit_lock:
+            idx0 = self.frame_idx
+            self._enqueue((idx0, arr))
+            self.frame_idx += arr.shape[0]
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
-    def release(self):
-        self.q.put(None)
-        self.thread.join()
-        if self.err is not None:
-            raise self.err
+    def release(self, abort: bool = False):
+        with self._release_lock:
+            if self._released:
+                if self.err is not None:
+                    raise self.err
+                return
+            if abort:
+                self._closing = True
+                with self._submit_lock:
+                    pass
+                # The in-progress cv2.imwrite call cannot safely be cancelled;
+                # discard only frames that have not begun writing.
+                self._drain_pending()
+            else:
+                with self._submit_lock:
+                    self._closing = True
+            if self.thread.is_alive():
+                try:
+                    self._enqueue(None, internal=True)
+                except Exception as exc:
+                    self._record_error(exc)
+            self.thread.join()
+            self._released = True
+            if self.err is not None:
+                raise self.err
 
 
 def color_chw_to_bgr(x: np.ndarray) -> np.ndarray:

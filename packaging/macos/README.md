@@ -75,16 +75,17 @@ exports **committed HEAD**, bundles relocatable CPython 3.12, installs PyTorch
 2.9.1 / torchvision 0.24.1 plus the project requirements, builds an arm64
 launcher and ad-hoc signs the bundle. It does not bundle weights or FFmpeg.
 
-The `Community desktop builds` GitHub Actions workflow uses a macOS 26 arm64
-runner while retaining a macOS 15 deployment target. It extracts the zip to a
+The `Community desktop builds` GitHub Actions workflow uses independent macOS 15
+and macOS 26 arm64 runners with a macOS 15 deployment target. It extracts the zip to a
 different directory containing spaces,
 removes the original build directory, verifies signatures, starts the native
 launcher in self-test mode, checks CLI imports/help and runs CPU-compatible
-regression tests, plus CPU-reference attention checks when Metal is available.
+regression tests, plus CPU-reference attention checks. Release verification
+requires arm64 and an available Metal device.
 An attention diagnostic report is retained even if a check fails. This proves
 packaging and startup, **not full-model MPS
-inference or Resolve compatibility**. MPS-only tests may be skipped when the
-hosted runner has no usable Metal GPU. The workflow uploads the app archive
+inference or Resolve compatibility**. Each OS has distinct artifacts and must
+pass its own checks; one OS passing does not verify the other. The workflow uploads the app archive
 only after those checks pass, and also compiles, tests, signs and packages the
 arm64 OFX bundle.
 

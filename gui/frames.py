@@ -12,7 +12,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # as corridorkey.video_i
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QImage
 
 from .clips import frame_files
@@ -152,6 +152,13 @@ class FrameSource:
         self._cutout_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._interrupted = threading.Event()
         self._next = 0
+        self.exact_count: int | None = None
+        self._count_callback = None
+        self._count_lock = threading.Lock()
+        self._count_proc: subprocess.Popen | None = None
+        self._count_cancel = threading.Event()
+        self._count_thread: threading.Thread | None = None
+        self._count_scan_finished = threading.Event()
         if self.files is None:
             validate_video(self.path)
             self.cap = cv2.VideoCapture(str(self.path))
@@ -161,11 +168,118 @@ class FrameSource:
             self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 24.0)
             self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # CAP_PROP_FRAME_COUNT can include samples hidden by MP4 edit lists.
+            # Count in the background so the first preview frame is still fast.
+            if self.path.is_file() and shutil.which("ffmpeg"):
+                self._count_thread = threading.Thread(
+                    target=self._count_video_frames, name="preview-frame-count", daemon=True)
+                self._count_thread.start()
+            else:
+                self._count_scan_finished.set()
         else:
+            self._count_scan_finished.set()
             if not self.files:
                 raise OSError(f"No frames in {self.path.name}")
             self.count = len(self.files)
             self.fps = sequence_fps
+
+    @property
+    def count_scan_finished(self) -> bool:
+        return self._count_scan_finished.is_set()
+
+    def set_count_callback(self, callback) -> None:
+        """Set a callback for scan completion (count or None if unavailable)."""
+        with self._count_lock:
+            self._count_callback = callback
+            count = self.exact_count
+            finished = self._count_scan_finished.is_set()
+        if finished:
+            callback(count)
+
+    def _count_video_frames(self) -> None:
+        try:
+            if self._count_cancel.is_set():
+                return
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg is None:
+                return
+            proc = subprocess.Popen(
+                [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+                 "-i", str(self.path), "-map", "0:v:0", "-an", "-sn", "-dn",
+                 "-fps_mode", "passthrough", "-nostats", "-progress", "pipe:1",
+                 "-f", "null", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            with self._count_lock:
+                self._count_proc = proc
+                cancel_now = self._count_cancel.is_set()
+            if cancel_now:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    stdout, stderr = proc.communicate()
+            else:
+                stdout, stderr = proc.communicate()
+            if self._count_cancel.is_set() or proc.returncode != 0 or stderr.strip():
+                return
+            progress = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+            count = int(progress["frame"].strip())
+            if progress.get("progress") != "end" or count <= 0:
+                return
+            with self._count_lock:
+                self.exact_count = self.count = count
+        except (OSError, KeyError, ValueError, subprocess.SubprocessError):
+            # A preview count is advisory. Keep OpenCV's metadata and surface
+            # actual frame decode failures if exact counting is unavailable.
+            return
+        finally:
+            with self._count_lock:
+                self._count_proc = None
+                self._count_scan_finished.set()
+                callback = self._count_callback
+                count = self.exact_count
+            if callback is not None:
+                callback(count)
+
+    def _cancel_count(self) -> None:
+        self._request_count_cancel()
+        with self._count_lock:
+            proc = self._count_proc
+        if proc is not None:
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        thread = self._count_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.2)
+
+    def _request_count_cancel(self) -> None:
+        """Ask the scan to stop without waiting; safe while loader locks are held."""
+        self._count_cancel.set()
+        with self._count_lock:
+            proc = self._count_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
 
     def read(self, index: int) -> np.ndarray:
         if self._interrupted.is_set():
@@ -287,22 +401,38 @@ class FrameSource:
         self._ffmpeg_next = 0
 
     def close(self) -> None:
-        self._stop_ffmpeg()
-        if self._camera_reader is not None:
-            self._camera_reader.close()
-            self._camera_reader = None
-        if self.cap is not None:
-            self.cap.release()
+        reader, self._camera_reader = self._camera_reader, None
+        cap, self.cap = self.cap, None
+        finalizers = [self._cancel_count, self._stop_ffmpeg]
+        if reader is not None:
+            finalizers.append(reader.close)
+        if cap is not None:
+            finalizers.append(cap.release)
+        errors = []
+        for close in finalizers:
+            try:
+                close()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def interrupt(self) -> None:
         """Interrupt the FFmpeg reader; VideoCapture stays owned by its reader thread."""
         self._interrupted.set()
+        self._request_count_cancel()
         proc = self._ffmpeg
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
         reader = self._camera_reader
         if reader is not None and reader.proc is not None and reader.proc.poll() is None:
-            reader.proc.terminate()
+            try:
+                reader.proc.terminate()
+            except ProcessLookupError:
+                pass
 
 
 class FrameLoader(QObject):
@@ -311,6 +441,10 @@ class FrameLoader(QObject):
 
     loaded = Signal(str, int, int, float, QImage)   # path, index, frame count, fps, image
     failed = Signal(str, str)                       # path, message
+    count_corrected = Signal(str, int)              # path, exact decodable frame count
+    _loaded_for_generation = Signal(int, str, int, int, float, QImage)
+    _failed_for_generation = Signal(int, str, str)
+    _count_for_generation = Signal(int, str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -324,6 +458,10 @@ class FrameLoader(QObject):
         self._active_generation: int | None = None
         self._shutdown_event = threading.Event()
         self._generation = 0
+        self._pending_count_failures: dict[int, tuple[tuple, str]] = {}
+        self._loaded_for_generation.connect(self._deliver_loaded, Qt.ConnectionType.QueuedConnection)
+        self._failed_for_generation.connect(self._deliver_failed, Qt.ConnectionType.QueuedConnection)
+        self._count_for_generation.connect(self._deliver_count, Qt.ConnectionType.QueuedConnection)
         self._thread = threading.Thread(target=self._run, name="frame-loader", daemon=True)
         self._thread.start()
 
@@ -337,6 +475,7 @@ class FrameLoader(QObject):
             self._request = (str(path), index, linear_float, cutout,
                              sequence_fps, cutout_linear, profile_id,
                              display_transform, input_range, generation)
+            self._pending_count_failures.clear()
             self._interrupt_active_before(generation)
             self._cond.notify()
 
@@ -377,13 +516,22 @@ class FrameLoader(QObject):
                 request, self._request = self._request, None
                 release, self._release = self._release, False
             if release:
-                for source in self._sources.values():
-                    source.close()
-                self._sources.clear()
+                sources, self._sources = self._sources, {}
+                for source in sources.values():
+                    self._safe_close(source)
             if request is not None:
                 self._load(*request)
         for source in self._sources.values():
+            self._safe_close(source)
+
+    @staticmethod
+    def _safe_close(source: FrameSource) -> None:
+        try:
             source.close()
+        except Exception:
+            # A broken decoder must not kill the loader and prevent later clips
+            # from being previewed.
+            pass
 
     def _load(self, path: str, index: int, linear_float: bool, cutout: bool,
               sequence_fps: float, cutout_linear: bool, profile_id: str,
@@ -396,8 +544,8 @@ class FrameLoader(QObject):
                     source.cutout != cutout or source.cutout_linear != cutout_linear or
                     source._interrupted.is_set() or source.profile_id != profile_id or
                     source.display_transform != display_transform or source.input_range != input_range)):
-                source.close()
-                del self._sources[path]
+                self._sources.pop(path, None)
+                self._safe_close(source)
                 source = None
             if source is None:
                 source = self._sources[path] = FrameSource(Path(path), linear_float,
@@ -405,9 +553,13 @@ class FrameLoader(QObject):
                                                           profile_id, display_transform, input_range)
                 if len(self._sources) > _MAX_OPEN:
                     oldest = next(iter(self._sources))
-                    self._sources.pop(oldest).close()
+                    self._safe_close(self._sources.pop(oldest))
             elif source.files is not None:
                 source.fps = sequence_fps
+            set_count_callback = getattr(source, "set_count_callback", None)
+            if set_count_callback is not None:
+                set_count_callback(
+                    lambda count, p=path, g=generation: self._on_exact_count(p, g, count))
             with self._active_lock:
                 self._active_source = source
                 self._active_generation = generation
@@ -420,15 +572,75 @@ class FrameLoader(QObject):
                 return
             h, w, _ = rgb.shape
             image = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
-            self.loaded.emit(path, index, source.count, source.fps, image)
+            self._loaded_for_generation.emit(generation, path, index, source.count,
+                                             source.fps, image)
         except Exception as exc:  # a bad frame must not kill the loader thread
-            if not self._is_stale(generation):
-                self.failed.emit(path, str(exc))
+            if self._is_stale(generation):
+                return
+            request = (path, index, linear_float, cutout, sequence_fps,
+                       cutout_linear, profile_id, display_transform, input_range, generation)
+            exact_count = getattr(source, "exact_count", None) if source is not None else None
+            if exact_count is not None:
+                self._resolve_count_failure(request, str(exc), exact_count)
+            elif source is not None:
+                with self._cond:
+                    if generation == self._generation:
+                        self._pending_count_failures[generation] = (request, str(exc))
+                # Close the race where counting finished between the first
+                # exact_count read and insertion into pending failures.
+                exact_count = getattr(source, "exact_count", None)
+                scan_finished = getattr(source, "count_scan_finished", False)
+                if exact_count is not None or scan_finished:
+                    self._on_exact_count(path, generation, exact_count)
+            else:
+                self._failed_for_generation.emit(generation, path, str(exc))
         finally:
             with self._active_lock:
                 if self._active_generation == generation:
                     self._active_source = None
                     self._active_generation = None
+
+    def _on_exact_count(self, path: str, generation: int, count: int | None) -> None:
+        with self._cond:
+            if generation != self._generation or self._shutdown_event.is_set():
+                return
+            if count is not None:
+                self._count_for_generation.emit(generation, path, count)
+            pending = self._pending_count_failures.pop(generation, None)
+            if pending is None:
+                return
+            request, message = pending
+            self._queue_count_resolution(request, message, count)
+
+    def _resolve_count_failure(self, request: tuple, message: str, count: int | None) -> None:
+        with self._cond:
+            if request[-1] != self._generation or self._shutdown_event.is_set():
+                return
+            self._queue_count_resolution(request, message, count)
+
+    def _queue_count_resolution(self, request: tuple, message: str, count: int | None) -> None:
+        (path, index, linear_float, cutout, sequence_fps, cutout_linear,
+         profile_id, display_transform, input_range, generation) = request
+        if count is not None and count > 0 and index >= count:
+            self._request = (path, count - 1, linear_float, cutout, sequence_fps,
+                             cutout_linear, profile_id, display_transform, input_range,
+                             generation)
+            self._cond.notify()
+        else:
+            self._failed_for_generation.emit(generation, path, message)
+
+    def _deliver_loaded(self, generation: int, path: str, index: int, count: int,
+                        fps: float, image: QImage) -> None:
+        if not self._is_stale(generation):
+            self.loaded.emit(path, index, count, fps, image)
+
+    def _deliver_failed(self, generation: int, path: str, message: str) -> None:
+        if not self._is_stale(generation):
+            self.failed.emit(path, message)
+
+    def _deliver_count(self, generation: int, path: str, count: int) -> None:
+        if not self._is_stale(generation):
+            self.count_corrected.emit(path, count)
 
     def _is_stale(self, generation: int) -> bool:
         with self._cond:

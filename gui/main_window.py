@@ -27,6 +27,7 @@ from .clip_box import ClipBox
 from .clip_list import ClipList
 from .clips import (
     DONE,
+    QUEUED,
     FAILED,
     RUNNING,
     STOPPED,
@@ -251,11 +252,17 @@ class MainWindow(QMainWindow):
             self.status.setText(f"{clip.name} has no output folder yet.")
 
     def _output_dir(self, clip: Clip) -> Path:
-        return clip.output_dir or output_dir_for(clip, self.settings.settings().output_parent)
+        settings = self.settings.settings()
+        target = clip.output_dir or output_dir_for(clip, settings.output_parent)
+        if find_outputs(clip, target):
+            return target
+        # Keep old flat renders readable; new work uses the source-owned root.
+        parent = Path(settings.output_parent) if settings.output_parent else clip.path.parent
+        legacy = parent / f"out_{clip.path.stem}"
+        return legacy if find_outputs(clip, legacy) else target
 
     def _outputs(self, clip: Clip | None) -> dict[str, Path]:
-        # A running clip's old outputs are being overwritten, so only its input is shown.
-        if clip is None or clip.status == RUNNING:
+        if clip is None:
             return {}
         return find_outputs(clip, self._output_dir(clip))
 
@@ -271,7 +278,7 @@ class MainWindow(QMainWindow):
         self.viewer.set_sequence_fps(settings.frame_dir_fps)
         self.viewer.set_cutout_linear(settings.cutout_linear)
         self.viewer.set_input_range(settings.input_range)
-        self.viewer.set_clip(clip, self._outputs(clip))
+        self.viewer.set_clip(clip, self._outputs(clip), self._output_dir(clip) if clip else None)
 
     def run_queue(self) -> None:
         if self.runner.is_running():
@@ -284,6 +291,22 @@ class MainWindow(QMainWindow):
                 return
             for clip in selected:
                 self.queue.requeue(clip)
+        from corridorkey.outputs import source_identity, validate_destination
+        settings = self.settings.settings()
+        destinations = {}
+        try:
+            for clip in self.queue.clips():
+                if clip.status != QUEUED:
+                    continue
+                destination = output_dir_for(clip, settings.output_parent).resolve()
+                identity = source_identity(clip.source)["id"]
+                if destination in destinations and destinations[destination] != identity:
+                    raise ValueError(f"Clips share an output directory: {destination}")
+                validate_destination(destination, clip.source)
+                destinations[destination] = identity
+        except (ValueError, OSError) as exc:
+            self.status.setText(str(exc))
+            return
         self.engine.stop()
         self.engine_button.setEnabled(False)
         self._counts.clear()
@@ -324,7 +347,9 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         parts = [f"{self._counts[s]} {s.lower()}"
                  for s in (DONE, FAILED, STOPPED) if self._counts[s]]
-        self.status.setText("Run finished: " + ", ".join(parts) + "." if parts else "Run finished.")
+        summary = "Run finished: " + ", ".join(parts) + "." if parts else "Run finished."
+        timing = getattr(self.runner, "last_run_timing", "")
+        self.status.setText(f"{summary} {timing}" if timing else summary)
         self.clip_box.refresh()
 
     def _toggle_engine(self) -> None:

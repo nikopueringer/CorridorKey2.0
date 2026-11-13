@@ -17,6 +17,7 @@ from . import color_utils as cu
 from .model import CorridorKeyV3
 from .device import area_resize, empty_cache, memory_budget_gb, model_device, synchronize
 from .mps_attention import available as native_attention_available
+from .outputs import OutputSnapshot, OutputTransaction, contained_path, merge_manifest, validate_destination
 from .video_io import (
     ExrSequenceWriter,
     ThreadedVideoWriter,
@@ -36,6 +37,7 @@ from .video_io import (
     safe_remove,
     taper_weights,
     window_starts,
+    validate_hann_window,
     SequentialFrameDirWindowReader,
     SequentialVideoWindowReader,
 )
@@ -134,6 +136,11 @@ class InferenceConfig:
     input_color_space: str = "legacy"
     color_output: str = "processed_working"
     input_range: str = "auto"
+
+    def validate(self) -> None:
+        validate_hann_window(self.hann_chunk, self.hann_stride)
+        if not self.outputs or not self.outputs <= {"alpha", "fg", "checker", "cutout"}:
+            raise ValueError("Select at least one supported output")
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -473,6 +480,22 @@ def _phase2_setup(model):
     synchronize(device)
 
 
+def _close_readers(*readers) -> None:
+    """Attempt every close, retaining an inference error already in flight."""
+    primary = sys.exc_info()[1]
+    errors = []
+    for reader in readers:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception as exc:
+                errors.append(exc)
+    if errors and primary is None:
+        raise errors[0]
+    for exc in errors:
+        print(f"[WARNING] Reader cleanup reported: {exc}")
+
+
 @torch.no_grad()
 def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                        chunk: int, stride: int, baton_path: Path,
@@ -624,9 +647,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
         synchronize(device)
         flush_before(T_all + 1)
     finally:
-        reader.close()
-        if hint_reader is not None:
-            hint_reader.close()
+        _close_readers(reader, hint_reader)
 
     if baton_fp16 is not None:
         baton_fp16.flush()
@@ -800,29 +821,8 @@ def _replace_rendered_rgb_with_source(rendered: dict[str, np.ndarray],
 
 
 def _write_color_manifest(path: str | os.PathLike, manifest: dict) -> None:
-    """Atomically update selected output descriptions, preserving old files."""
-    path = Path(path)
-    merged = dict(manifest)
-    outputs = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing.get("outputs"), dict):
-                outputs.update(existing["outputs"])
-        except (OSError, ValueError, TypeError):
-            pass
-    outputs.update(manifest.get("outputs", {}))
-    merged["outputs"] = outputs
-    temp_path = path.with_name(path.name + f".tmp-{os.getpid()}")
-    try:
-        with open(temp_path, "w", encoding="utf-8") as mf:
-            json.dump(merged, mf, indent=2)
-            mf.write("\n")
-            mf.flush()
-            os.fsync(mf.fileno())
-        os.replace(temp_path, path)
-    finally:
-        safe_remove(temp_path)
+    """Compatibility helper for atomically merging output descriptions."""
+    merge_manifest(Path(path), manifest)
 
 
 def _encode_rendered_camera_source(rendered: dict[str, np.ndarray],
@@ -872,6 +872,8 @@ def _encode_rendered_camera_source(rendered: dict[str, np.ndarray],
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
+    cfg.validate()
+    validate_destination(Path(output_dir), input_path)
     # Half EXR cannot retain adjacent 16-bit source codes. Apply the same
     # fidelity guarantee to CLI/API callers as to the desktop output control.
     if cfg.color_output == "source_rgb" and cfg.exr_dtype != "float":
@@ -936,6 +938,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
         apply_auto_vram(cfg, (H, W), T_all, device)
+    cfg.validate()
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
@@ -945,6 +948,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker_t = torch.from_numpy(checker)
     writers = {}
     source_reader = None
+    transaction = OutputTransaction(Path(output_dir), input_path, clip_name)
+    render_dir = transaction.stage
+    scratch = tempfile.TemporaryDirectory(prefix="inference-", dir=cfg.temp_dir)
+    scratch_dir = Path(scratch.name)
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -961,7 +968,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             if use_exr:
                 channels = 4 if name == "cutout" else (1 if name == "alpha" else 3)
                 writers[name] = ExrSequenceWriter(
-                    os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
+                    str(render_dir / f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
                     dtype=cfg.exr_dtype, frame_name=suffix[name])
             else:
@@ -969,7 +976,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 channels = 4 if name == "cutout" else 3
                 color_trc = "linear" if (name == "cutout" and cfg.cutout_linear) else "iec61966-2-1"
                 writers[name] = ThreadedVideoWriter(
-                    os.path.join(output_dir, f"{clip_name}_{suffix[name]}{ext}"),
+                    str(render_dir / f"{clip_name}_{suffix[name]}{ext}"),
                     fps, (W_out, H_out), writer_cfg, channels=channels,
                     color_trc=color_trc,
                     tag_color=not (
@@ -1009,6 +1016,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             extension = "_exr" if use_exr else (".mov" if name == "cutout" else ".mp4")
             output_profiles[name]["path"] = f"{clip_name}_{suffix[name]}{extension}"
             output_profiles[name]["native_fps"] = fps
+            output_profiles[name]["start_frame"] = int(meta.get("start_frame", 0))
         color_manifest = {
             "schema_version": 1,
             "native_fps": fps,
@@ -1025,7 +1033,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 "video codec. Camera primaries/TRC tags are omitted; Y'CbCr "
                 "matrix metadata is BT.709. Use EXR for unclipped float output.")
         # Write settings log file in the output folder
-        settings_path = os.path.join(output_dir, f"{clip_name}_settings.txt")
+        settings_path = render_dir / f"{clip_name}_settings.txt"
         try:
             with open(settings_path, "w") as sf:
                 sf.write(f"CorridorKey v2 Inference Settings Log\n")
@@ -1074,9 +1082,9 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         _phase1_setup(model, stage1_on_gpu=not cfg.low_vram)
         if cfg.low_vram:
             configure_low_vram_inference(model, cfg)
-        rvm_path = cfg.temp_dir / f"{clip_name}_rvm_feat.f16"
-        baton_path = cfg.temp_dir / f"{clip_name}_baton.f16"
-        foundation_prefix = cfg.temp_dir / f"{clip_name}_foundation"
+        rvm_path = scratch_dir / f"{clip_name}_rvm_feat.f16"
+        baton_path = scratch_dir / f"{clip_name}_baton.f16"
+        foundation_prefix = scratch_dir / f"{clip_name}_foundation"
         for p in (
             rvm_path, baton_path, Path(str(foundation_prefix) + "_cradio.f32"),
             Path(str(foundation_prefix) + "_moge.f32"),
@@ -1192,6 +1200,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
 
         if cfg.low_vram:
             _phase2_setup(model)
+            print(f"    Stage2 rendering: frames={T_all}", flush=True)
             baton = np.memmap(
                 baton_path, dtype=np.float16, mode="r",
                 shape=(T_all, model.stage1.d_16, H // 16, W // 16))
@@ -1205,31 +1214,54 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                         for t in range(t0, t1)
                     ]
                     write_prediction_batches(items)
+                    print(f"      output frames {t1}/{T_all}", flush=True)
                     del model_chunk, _display_chunk, _review_chunk, items
             finally:
-                reader.close()
-                del baton
+                try:
+                    _close_readers(reader)
+                finally:
+                    del baton
+        print("    Keying complete; closing outputs", flush=True)
     finally:
-        camera_close_error = None
+        primary_error = sys.exc_info()[1]
+        cleanup_errors = []
         if source_reader is not None:
             try:
                 source_reader.close()
             except Exception as exc:
-                camera_close_error = exc
+                cleanup_errors.append(exc)
         for writer in writers.values():
-            writer.release()
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
-        empty_cache(device)
-        if camera_close_error is not None:
-            if sys.exc_info()[0] is None:
-                raise camera_close_error
-            print(f"[WARNING] Camera source decoder close reported: {camera_close_error}")
-    # Publish the interpretation only after every selected output is closed
-    # successfully; a failed attempt must not relabel an older completed render.
-    _write_color_manifest(
-        os.path.join(output_dir, f"{clip_name}_color.json"), color_manifest)
+            try:
+                writer.release(abort=primary_error is not None or bool(cleanup_errors))
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        for finalizer in (scratch.cleanup, lambda: empty_cache(device)):
+            try:
+                finalizer()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if primary_error is not None or cleanup_errors:
+            try:
+                transaction.abort()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            if primary_error is None:
+                raise cleanup_errors[0]
+            for exc in cleanup_errors:
+                print(f"[WARNING] Cleanup reported: {exc}")
+    try:
+        for name, writer in writers.items():
+            if writer.written_frames != T_all:
+                raise RuntimeError(f"Incomplete {name} output: {writer.written_frames}/{T_all} frames")
+        published = transaction.commit(color_manifest, T_all)
+    except BaseException:
+        try:
+            transaction.abort()
+        except Exception as exc:
+            print(f"[WARNING] Staging cleanup reported: {exc}")
+        raise
     print(f"  wrote {len(writers)} output(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
+    return OutputSnapshot(
+        {name: contained_path(transaction.root, entry["path"])
+         for name, entry in published["outputs"].items()}, published)

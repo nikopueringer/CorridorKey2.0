@@ -19,7 +19,8 @@ from corridorkey.runtime import (
     load_model,
     run_inference,
 )
-from corridorkey.video_io import require_ffmpeg
+from corridorkey.video_io import require_ffmpeg, validate_hann_window
+from corridorkey.outputs import validate_destination
 from corridorkey.media_probe import validate_video, count_decoded_video_frames
 from corridorkey.device import configure_auto_memory, select_device
 
@@ -129,6 +130,14 @@ def main():
                     default=2048)
     args = ap.parse_args()
 
+    hann_chunk = args.hann_chunk if args.hann_chunk is not None else 80
+    hann_stride = args.hann_stride if args.hann_stride is not None else max(1, hann_chunk // 2)
+    try:
+        validate_hann_window(hann_chunk, hann_stride)
+        validate_destination(Path(args.output_dir), args.input)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     require_ffmpeg(args.ffmpeg_bin)
     if not Path(args.input).is_dir():
         validate_video(args.input)
@@ -152,8 +161,6 @@ def main():
     auto_vram = args.hann_chunk is None and args.hann_stride is None and not args.low_vram
     if auto_vram:
         configure_auto_memory(device)
-    hann_chunk = args.hann_chunk if args.hann_chunk is not None else 80
-    hann_stride = args.hann_stride if args.hann_stride is not None else max(1, hann_chunk // 2)
     infer_cfg = InferenceConfig(
         hann_chunk=hann_chunk,
         hann_stride=hann_stride,
@@ -188,6 +195,7 @@ def main():
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
     )
+    infer_cfg.validate()
     model = load_model(paths, device=device)
     run_inference(
         model,
