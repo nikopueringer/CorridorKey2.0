@@ -103,9 +103,10 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         self.engine_status = QLabel("Single-frame OFX · temporal keying in the queue")
         self.engine_status.setObjectName("subtle")
-        self.engine_button = QPushButton("Start Resolve engine")
-        self.engine_button.setToolTip("Load the CUDA model for the Linux OFX plugin. Queue rendering stops the engine to release GPU memory.")
-        if sys.platform.startswith("linux"):
+        self.engine_button = QPushButton("Start OFX engine")
+        self.engine_button.setToolTip("Start the persistent single-frame engine for the Resolve OFX plugin. "
+                                      "To render clips from this window, use Run queue below.")
+        if sys.platform.startswith(("linux", "darwin")):
             row.addWidget(self.engine_status)
             row.addWidget(self.engine_button)
         return header
@@ -261,6 +262,10 @@ class MainWindow(QMainWindow):
         clips = self.queue.selected_clips()
         self.clip_box.set_clips(clips)
         clip = clips[0] if clips else None
+        self.settings.set_sequence_source(clip.is_frames if clip is not None else None)
+        settings = self.settings.settings()
+        self.viewer.set_sequence_fps(settings.frame_dir_fps)
+        self.viewer.set_cutout_linear(settings.cutout_linear)
         self.viewer.set_clip(clip, self._outputs(clip))
 
     def run_queue(self) -> None:
@@ -325,7 +330,7 @@ class MainWindow(QMainWindow):
 
     def _engine_changed(self, message: str) -> None:
         self.engine_status.setText(message)
-        self.engine_button.setText("Stop Resolve engine" if self.engine.proc else "Start Resolve engine")
+        self.engine_button.setText("Stop OFX engine" if self.engine.proc else "Start OFX engine")
 
     def report_error(self, text: str) -> None:
         self.log.appendPlainText(text)

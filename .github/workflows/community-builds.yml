@@ -20,6 +20,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
+      - name: Fetch OpenFX headers
+        run: git clone --depth 1 --branch OFX_Release_1_4_TAG https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+      - name: Build and package the macOS OFX plugin
+        env:
+          OFX_INCLUDE_DIR: ${{ runner.temp }}/openfx/include
+        run: ./scripts/package_macos_ofx.sh
+      - name: Verify OpenFX bundle executable discovery name
+        run: |
+          ditto -x -k dist/CorridorKeyMacOS-OFX-arm64.zip "$RUNNER_TEMP/mac-ofx"
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          bundle = Path("${{ runner.temp }}/mac-ofx/CorridorKeyMacOS-OFX/CorridorKeyMacOS.ofx.bundle")
+          executable = bundle.name.removesuffix(".bundle")
+          plist = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+          assert plist["CFBundleExecutable"] == executable, plist["CFBundleExecutable"]
+          assert (bundle / "Contents/MacOS" / executable).is_file()
+          PY
       - name: Build native app with bundled Python
         run: ./scripts/build_macos.sh
       - name: Verify the archived app after relocation
@@ -44,12 +62,20 @@ jobs:
           cd "$SRC"
           PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
             tests/test_device.py tests/test_window_batching.py tests/test_mps_attention.py \
-            tests/test_frame_paths.py tests/test_preprocess_lut.py tests/test_asset_paths.py tests/test_linux_gui.py
+            tests/test_frame_paths.py tests/test_preprocess_lut.py tests/test_asset_paths.py tests/test_linux_gui.py \
+            tests/test_ofx_protocol.py tests/test_ofx_worker.py tests/test_ofx_memory.py tests/test_media_probe.py
       - name: Upload Apple Silicon build
         uses: actions/upload-artifact@v4
         with:
           name: CorridorKey-macOS-arm64
           path: dist/CorridorKey-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload Apple Silicon OFX plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKeyMacOS-ofx-arm64
+          path: dist/CorridorKeyMacOS-OFX-arm64.zip
           if-no-files-found: error
           retention-days: 30
       - name: Upload diagnostic log

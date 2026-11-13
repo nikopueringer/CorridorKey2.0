@@ -1,4 +1,4 @@
-// CorridorKey community Linux bridge. See ../LICENSE for the project licence.
+// CorridorKey community OFX bridge. See ../LICENSE for the project licence.
 #include <ofxCore.h>
 #include <ofxImageEffect.h>
 #include <ofxParam.h>
@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -108,7 +110,14 @@ void transfer(int fd, void* buffer, size_t length, bool sending, OfxImageEffectH
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) throw std::runtime_error("Cannot poll CorridorKey engine");
         if (!ready) continue;
-        const ssize_t n = sending ? send(fd, p, length, MSG_NOSIGNAL | MSG_DONTWAIT) : recv(fd, p, length, MSG_DONTWAIT);
+        // Linux needs MSG_NOSIGNAL per send; Darwin uses SO_NOSIGPIPE on the
+        // socket. Never change the host application's process-wide signals.
+#if defined(__APPLE__)
+        constexpr int sendFlags = 0;
+#else
+        constexpr int sendFlags = MSG_NOSIGNAL;
+#endif
+        const ssize_t n = sending ? send(fd, p, length, sendFlags) : recv(fd, p, length, 0);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
         if (n <= 0) throw std::runtime_error("CorridorKey engine disconnected; check the desktop app log");
         p += n; length -= size_t(n);
@@ -121,23 +130,66 @@ std::vector<float> infer(Instance& inst, const std::string& path, std::vector<fl
     sockaddr_un address{}; address.sun_family = AF_UNIX;
     if (path.empty() || path.size() >= sizeof(address.sun_path)) throw std::runtime_error("Invalid engine socket path");
     std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+#if defined(__APPLE__)
+    address.sun_len = static_cast<decltype(address.sun_len)>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+#endif
     Socket sock;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
     for (;;) {
         if (effects->abort(inst.effect)) throw Cancelled{};
-        sock.fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        // Set flags with fcntl instead of socket type flags, which are not
+        // available consistently across Linux and macOS.
+        sock.fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sock.fd < 0) throw std::runtime_error("Cannot create engine connection");
-        if (connect(sock.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) break;
-        const int error = errno;
+#if defined(__APPLE__)
+        int noSigPipe = 1;
+        if (setsockopt(sock.fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+            close(sock.fd); sock.fd = -1;
+            throw std::runtime_error("Cannot configure engine connection");
+        }
+#endif
+        const int fdFlags = fcntl(sock.fd, F_GETFD);
+        const int statusFlags = fcntl(sock.fd, F_GETFL);
+        if (fdFlags < 0 || statusFlags < 0 ||
+            fcntl(sock.fd, F_SETFD, fdFlags | FD_CLOEXEC) < 0 ||
+            fcntl(sock.fd, F_SETFL, statusFlags | O_NONBLOCK) < 0) {
+            close(sock.fd); sock.fd = -1;
+            throw std::runtime_error("Cannot configure engine connection");
+        }
+        const socklen_t addressSize = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
+        int error = 0;
+        if (connect(sock.fd, reinterpret_cast<sockaddr*>(&address), addressSize) == 0) break;
+        error = errno;
+        if (error == EINPROGRESS) {
+            while (error == EINPROGRESS) {
+                if (effects->abort(inst.effect)) throw Cancelled{};
+                if (std::chrono::steady_clock::now() > deadline) break;
+                pollfd wait{sock.fd, POLLOUT, 0};
+                const int ready = poll(&wait, 1, 100);
+                if (ready < 0 && errno == EINTR) continue;
+                if (ready < 0) { error = errno; break; }
+                if (ready == 0) continue;
+                socklen_t errorSize = sizeof(error);
+                if (getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, &error, &errorSize) != 0) error = errno;
+                else if (error == 0) break;
+            }
+            if (error == 0) break;
+        }
         close(sock.fd); sock.fd = -1;
         if (error != EAGAIN && error != EINTR && error != EINPROGRESS)
-            throw std::runtime_error("Start Resolve engine in the CorridorKey desktop app, then press Refresh in this effect");
+            throw std::runtime_error("Start the OFX engine in the CorridorKey desktop app, then press Refresh in this effect");
         if (std::chrono::steady_clock::now() > deadline)
             throw std::runtime_error("CorridorKey engine remained busy for 10 minutes");
         poll(nullptr, 0, 100);
     }
+#if defined(__APPLE__)
+    uid_t peerUid = static_cast<uid_t>(-1); gid_t peerGid = static_cast<gid_t>(-1);
+    const bool sameUser = getpeereid(sock.fd, &peerUid, &peerGid) == 0 && peerUid == getuid();
+#else
     ucred peer{}; socklen_t peerSize = sizeof(peer);
-    if (getsockopt(sock.fd, SOL_SOCKET, SO_PEERCRED, &peer, &peerSize) != 0 || peer.uid != getuid())
+    const bool sameUser = getsockopt(sock.fd, SOL_SOCKET, SO_PEERCRED, &peer, &peerSize) == 0 && peer.uid == getuid();
+#endif
+    if (!sameUser)
         throw std::runtime_error("Engine socket belongs to another user");
     std::array<char, 32> request{};
     std::memcpy(request.data(), "CK2REQ01", 8);
@@ -227,7 +279,7 @@ OfxStatus describe(OfxImageEffectHandle effect) {
     str(p, kOfxImageEffectPluginPropGrouping, "Keyer");
     // Optional OFX 1.2 metadata: Resolve's bundled wrapper likewise ignores
     // unsupported-description errors. Essential rendering properties stay strict.
-    props->propSetString(p, kOfxPropPluginDescription, 0, "Experimental Linux single-frame keyer. Start Resolve engine in the CorridorKey desktop UI. Use the GUI queue for temporal keying and hints.");
+    props->propSetString(p, kOfxPropPluginDescription, 0, "Experimental single-frame keyer. Start Resolve engine in the CorridorKey desktop UI. Use the GUI queue for temporal keying and hints.");
     str(p, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextFilter);
     str(p, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextGeneral, 1);
     str(p, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat);
@@ -330,6 +382,8 @@ OfxStatus entry(const char* action, const void* handle, OfxPropertySetHandle in,
     } catch (...) { return kOfxStatFailed; }
 }
 void setHost(OfxHost* h) { host = h; }
+// Keep this identifier stable: saved Resolve effects refer to it, including
+// on macOS where the plugin is packaged in a platform-specific bundle.
 OfxPlugin plugin{kOfxImageEffectPluginApi, 1, "org.corridorkey.community.linux", 0, 1, setHost, entry};
 } // namespace
 

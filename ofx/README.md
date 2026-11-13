@@ -1,10 +1,10 @@
-# CorridorKey community Linux app and OpenFX bridge
+# CorridorKey community desktop app and OpenFX bridge
 
-An experimental Linux x86-64 build around the public CorridorKey 2.0 model.
+Experimental Linux x86-64 and macOS arm64 builds around the public CorridorKey 2.0 model.
 The desktop UI continues David Coelho's [PR #8](https://github.com/nikopueringer/CorridorKey2.0/pull/8).
 This community contribution is separate from the official paid plugin.
 
-## Setup
+## Linux setup
 
 Requirements: a supported NVIDIA GPU and working driver, ffmpeg, `uv`, and
 around 15 GB free for the Python environment, CUDA libraries and model weights.
@@ -29,7 +29,7 @@ Hann windows, automatic VRAM selection and first-frame/full-video hints.
 EXR outputs are scene-linear; cutout MOV files are ProRes 4444 with straight
 alpha. Import these rendered outputs into Resolve for temporal work.
 
-## Build and install OpenFX
+## Build and install Linux OpenFX
 
 Requires a C++17 compiler, CMake, and OpenFX headers. The default header path
 uses the SDK bundled with Resolve. Headers from
@@ -58,7 +58,7 @@ will not pick up this user-local path unless configured separately.
 `./scripts/resolve_with_ofx.sh` sets this path and launches Resolve for you.
 
 1. Restart Resolve after installation.
-2. In the CorridorKey GUI, click **Start Resolve engine** and wait for
+2. In the CorridorKey GUI, click **Start OFX engine** and wait for
    **Resolve engine ready**. Keep the app open while using the effect.
 3. Add **CorridorKey 2.0 Community**, in the **Keyer** group.
 4. Choose the correct **Input colour**: sRGB transfer / Rec.709 primaries, or
@@ -78,17 +78,31 @@ scratch directories and float32 RGBA transport. One model request runs at a
 time; multiple plugin instances share it. Starting the GUI queue stops the
 engine owned by that UI to release GPU memory.
 
+## Apple Silicon OpenFX
+
+Use the matching community app and OFX archives on macOS 15 or later; the app
+contains the Python/MPS worker required by the small native plugin. See
+[Mac app and OFX installation](../packaging/macos/README.md). The plugin bundle is
+`CorridorKeyMacOS.ofx.bundle`, installed in `/Library/OFX/Plugins`. It is separate
+from the commercial plugin. Start **OFX engine** in the app after downloading
+models, wait for ready, and keep the app running while Resolve uses the effect.
+
+The Metal worker applies bounded spatial attention batches as well as a
+single-frame temporal window. Full-model MPS inference and actual Resolve
+rendering on macOS remain unverified; native bundle loading and local transport
+are covered by the macOS mock-host and worker tests.
+
 ## Current limits
 
 - OFX is a **single-frame** keyer. Temporal windows and hints remain available
   in the standalone queue, not inside this first OFX implementation.
 - Inference is not real-time playback. Resolve's render cache can help with
   playback; each effect also keeps one exact input/result in memory.
-- Linux x86-64, progressive frames and CPU-side float RGBA host buffers only.
+- Linux x86-64 or macOS arm64, progressive frames and CPU-side float RGBA host buffers only.
   No CUDA zero-copy. Maximum 16,777,216 pixels and 8192 on either side; native
   UHD/DCI 4K fits, full 8K exceeds the protocol limit.
 - Cancellation discards queued obsolete frames and checks between model
-  phases/windows. An already executing CUDA operation cannot be preempted.
+  phases/windows. An already executing GPU operation cannot be preempted.
 - Source alpha is multiplied with predicted alpha. Matte and foreground
   preview modes output opaque images.
 - Failures are reported to the host rather than silently returning an unkeyed

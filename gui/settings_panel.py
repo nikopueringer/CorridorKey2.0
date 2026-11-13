@@ -39,6 +39,7 @@ class SettingsPanel(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._loading = False
+        self._sequence_source: bool | None = None
         body = QWidget()
         column = QVBoxLayout(body)
         column.setContentsMargins(0, 0, 6, 0)
@@ -144,9 +145,10 @@ class SettingsPanel(QScrollArea):
         self.fps = QDoubleSpinBox()
         self.fps.setRange(1.0, 240.0)
         self.fps.setDecimals(3)
-        self.fps.setToolTip("Frame rate written for frame-folder inputs.")
+        self.fps.setToolTip("Playback and output frame rate for image-sequence folders. "
+                            "Video clips use the frame rate recorded in the video.")
         form.addRow("Colour", self.frame_colour)
-        form.addRow("Frame rate", self.fps)
+        form.addRow("Sequence FPS", self.fps)
         self.frame_colour.currentIndexChanged.connect(self._on_change)
         self.fps.valueChanged.connect(self._on_change)
         return box
@@ -233,6 +235,11 @@ class SettingsPanel(QScrollArea):
         self._loading = False
         self._sync_enabled()
 
+    def set_sequence_source(self, is_sequence: bool | None) -> None:
+        """Enable sequence timing only while an image folder is selected."""
+        self._sequence_source = is_sequence
+        self._sync_enabled()
+
     def _on_change(self) -> None:
         if self._loading:
             return
@@ -284,3 +291,4 @@ class SettingsPanel(QScrollArea):
         self.stride.setEnabled(manual)
         self.start_mode.setEnabled(self.num_frames.value() > 0)
         self.out_parent.setEnabled(self.out_mode.currentData() == "custom")
+        self.fps.setEnabled(self._sequence_source is not False)

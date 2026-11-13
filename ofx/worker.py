@@ -1,4 +1,4 @@
-"""Persistent CUDA worker for Linux OpenFX. Start with python -m ofx.worker.
+"""Persistent CUDA/MPS worker for OpenFX. Start with python -m ofx.worker.
 
 One model, one inference at a time. OFX requests use independent single-frame
 windows, so seeking is deterministic. For temporal keying and hints use the
@@ -13,16 +13,33 @@ from pathlib import Path
 import signal
 import socket
 import stat
-import struct
 import tempfile
 import traceback
 
 from .protocol import (LINEAR, REQUEST, RESPONSE, RESPONSE_MAGIC, default_socket,
-                       disconnected, parse_request, private_directory, receive, send_error)
+                       disconnected, parse_request, private_directory, receive, send_error,
+                       peer_uid, MAX_SOCKET_PATH_BYTES)
 
 
 class Cancelled(Exception):
     """The host abandoned this frame; drop it and move to the next client."""
+
+
+def frame_config(device, scratch: Path, linear: bool, despill: float):
+    from corridorkey.runtime import InferenceConfig
+    cfg = InferenceConfig(
+        hann_chunk=1, hann_stride=1, low_vram=True, auto_vram=False,
+        carry_hint=False, outputs={"cutout"}, output_format="exr", exr_dtype="float",
+        frame_dir_linear=linear, despill_strength=despill, temp_dir=scratch,
+    )
+    if device.type == "mps":
+        # Single-frame requests bypass automatic temporal sizing. Still bound
+        # spatial attention allocations for standard PyTorch MPS SDPA.
+        cfg.low_vram_foundation_chunk = 1
+        cfg.low_vram_swin_window_batch = 1
+        cfg.low_vram_mlp_chunk_tokens = 4096
+        cfg.low_vram_full_attn_query_chunk_tokens = 128
+    return cfg
 
 
 class Engine:
@@ -31,20 +48,20 @@ class Engine:
         os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        import torch
+        from corridorkey.device import select_device, configure_auto_memory
         from corridorkey.runtime import RuntimePaths, load_model
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable. Check the NVIDIA driver and CUDA PyTorch installation.")
-        self.model = load_model(RuntimePaths.from_package(root), device="cuda")
+        self.device = select_device()
+        configure_auto_memory(self.device)
+        self.model = load_model(RuntimePaths.from_package(root), device=str(self.device))
         self.model.requires_grad_(False)
 
     def key(self, pixels, linear: bool, despill: float, cancelled=lambda: False):
         import cv2
         import numpy as np
-        import torch
         from corridorkey import color_utils
-        from corridorkey.runtime import InferenceConfig, WriterConfig, run_inference
+        from corridorkey.device import empty_cache
+        from corridorkey.runtime import WriterConfig, run_inference
 
         if not np.isfinite(pixels).all():
             raise ValueError("Input contains NaN or infinite pixels")
@@ -56,11 +73,7 @@ class Engine:
             source.mkdir()
             if not cv2.imwrite(str(source / "frame.exr"), pixels[:, :, 2::-1]):
                 raise RuntimeError("Could not write the input EXR")
-            cfg = InferenceConfig(
-                hann_chunk=1, hann_stride=1, low_vram=True, auto_vram=False,
-                carry_hint=False, outputs={"cutout"}, output_format="exr", exr_dtype="float",
-                frame_dir_linear=linear, despill_strength=despill, temp_dir=root / "scratch",
-            )
+            cfg = frame_config(self.device, root / "scratch", linear, despill)
             hooks = []
             def check_cancel(*_):
                 if cancelled():
@@ -68,11 +81,11 @@ class Engine:
 
             try:
                 check_cancel()
-                # A preceding frame can leave stage 2 on CUDA. Move both stages
+                # A preceding frame can leave stage 2 on the GPU. Move both stages
                 # out before foundations are uploaded by the low-VRAM runtime.
                 self.model.stage1.cpu()
                 self.model.stage2.cpu()
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
                 # Abort at model phase/window boundaries. A running GPU kernel
                 # itself cannot be preempted safely by the host's cancellation.
                 for module in (self.model.foundations, self.model.foundations.rvm,
@@ -99,15 +112,15 @@ class Engine:
                 for hook in hooks:
                     hook.remove()
                 # The persistent worker must not monopolize unused cached VRAM.
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
 
 
 def serve(path: Path, engine_factory=Engine) -> None:
     import numpy as np
 
     private_directory(path.parent)
-    if len(os.fsencode(path)) >= 108:
-        raise ValueError("Unix socket path is too long (maximum 107 bytes)")
+    if len(os.fsencode(path)) > MAX_SOCKET_PATH_BYTES:
+        raise ValueError(f"Unix socket path is too long (maximum {MAX_SOCKET_PATH_BYTES} bytes)")
     # Lock lives for the entire server lifetime. A second start cannot unlink
     # the first server's socket. O_NOFOLLOW rejects a substituted lock symlink.
     lock_fd = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -144,8 +157,7 @@ def serve(path: Path, engine_factory=Engine) -> None:
                     with conn:
                         conn.settimeout(30)
                         try:
-                            _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                            if uid != os.getuid():
+                            if peer_uid(conn) != os.getuid():
                                 raise PermissionError("Only the current user may connect")
                             w, h, flags, despill, size = parse_request(receive(conn, REQUEST.size))
                             pixels = np.frombuffer(receive(conn, size), dtype="<f4").reshape(h, w, 4)

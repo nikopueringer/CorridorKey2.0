@@ -30,7 +30,7 @@ def main():
     apply_theme(app)
     window = MainWindow()
     window.show()
-    assert not window.engine_button.isVisible()
+    assert window.engine_button.isVisible()
     QTimer.singleShot(500, window.close)
     QTimer.singleShot(700, app.quit)
     code = app.exec()

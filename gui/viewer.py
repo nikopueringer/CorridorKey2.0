@@ -21,8 +21,10 @@ from .clips import Clip
 from .frames import FrameLoader
 from .theme import TEXT, VIEWER_BG, font, icon_path
 
-VIEWS = (("input", "Input"), ("alpha", "Alpha"), ("fg", "Foreground"), ("checker", "Checker"))
-PLACEHOLDER = "Drop clips, frame folders or a folder of clips anywhere in this window."
+VIEWS = (("input", "Input"), ("alpha", "Alpha"), ("fg", "Foreground"),
+         ("cutout", "Cutout"), ("checker", "Checker"))
+PLACEHOLDER = ("Drop clips or frame folders here. Select a clip, then click Run queue "
+               "below to create output previews.")
 
 
 class ImageView(QWidget):
@@ -134,6 +136,8 @@ class ViewerPanel(QWidget):
         self._index = 0
         self._count = 0
         self._fps = 24.0
+        self._sequence_fps = 24.0
+        self._cutout_linear = False
         self._waiting = False
         self._transport: list[QToolButton] = []
 
@@ -187,6 +191,10 @@ class ViewerPanel(QWidget):
         self.frame_label.setObjectName("subtle")
         self.frame_label.setMinimumWidth(90)
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.metadata_label = QLabel()
+        self.metadata_label.setObjectName("subtle")
+        self.guidance_label = QLabel()
+        self.guidance_label.setObjectName("subtle")
         bottom = QHBoxLayout()
         bottom.setSpacing(4)
         for button in transport:
@@ -200,6 +208,8 @@ class ViewerPanel(QWidget):
         column.setContentsMargins(10, 10, 10, 8)
         column.setSpacing(8)
         column.addLayout(top)
+        column.addWidget(self.guidance_label)
+        column.addWidget(self.metadata_label)
         column.addWidget(self.image, 1)
         column.addLayout(bottom)
 
@@ -228,19 +238,29 @@ class ViewerPanel(QWidget):
             key = button.property("view")
             button.setEnabled(key in self._paths)
             button.setToolTip("" if key in self._paths or key == "input"
-                              else "Run the clip to see this output")
+                              else "Click Run queue below to create this output preview")
         if self._view not in self._paths:
             self._view = "input"
         self._check_tab()
         for widget in (self.folder_button, self.slider, *self._transport):
             widget.setEnabled(clip is not None)
         self.image.placeholder = PLACEHOLDER
+        self.metadata_label.clear()
+        self.guidance_label.setText(
+            "Input preview · click Run queue below to generate output previews."
+            if clip is not None and not outputs else "")
         if clip is None:
             self._count = 0
             self.frame_label.setText("–")
             self.image.set_image(QImage())
             return
         self._request()
+
+    def set_sequence_fps(self, fps: float) -> None:
+        self._sequence_fps = fps
+
+    def set_cutout_linear(self, linear: bool) -> None:
+        self._cutout_linear = linear
 
     def has_view(self, key: str) -> bool:
         return key in self._paths
@@ -286,7 +306,10 @@ class ViewerPanel(QWidget):
     def _request(self) -> None:
         self._waiting = True
         self.loader.request(self._paths[self._view], self._index,
-                            linear_float=self._view != "alpha")
+                            linear_float=self._view != "alpha",
+                            cutout=self._view == "cutout",
+                            sequence_fps=self._sequence_fps,
+                            cutout_linear=self._cutout_linear)
 
     def _tick(self) -> None:
         if not self._waiting and self._count:
@@ -312,6 +335,9 @@ class ViewerPanel(QWidget):
         self.slider.blockSignals(False)
         self.frame_label.setText(f"<span style='color:{TEXT}; font-weight:600'>{index + 1}</span>"
                                  f" / {count}")
+        duration = count / fps if fps > 0 else 0.0
+        self.metadata_label.setText(f"{image.width()} × {image.height()} · {fps:g} fps · "
+                                    f"{count} frames · {duration:.2f} s")
         self.image.set_image(image)
 
     def _on_failed(self, path: str, message: str) -> None:

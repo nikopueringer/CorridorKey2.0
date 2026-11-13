@@ -20,6 +20,7 @@ from corridorkey.runtime import (
     run_inference,
 )
 from corridorkey.video_io import require_ffmpeg
+from corridorkey.media_probe import validate_video
 from corridorkey.device import configure_auto_memory, select_device
 
 
@@ -118,8 +119,10 @@ def main():
                     default=2048)
     args = ap.parse_args()
 
-    device = select_device()
     require_ffmpeg(args.ffmpeg_bin)
+    if not Path(args.input).is_dir():
+        validate_video(args.input)
+    device = select_device()
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
     writer_cfg = WriterConfig(

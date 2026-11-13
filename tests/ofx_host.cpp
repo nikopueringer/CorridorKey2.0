@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -97,7 +98,17 @@ void image(Clip& c,bool negativeStride=false) {
     c.image.s[kOfxImageEffectPropPreMultiplication]={kOfxImagePreMultiplied};
 }
 void exact(int fd,void* p,size_t n,bool write=false) {
-    while(n){ssize_t k=write?send(fd,p,n,MSG_NOSIGNAL):recv(fd,p,n,0);assert(k>0);p=static_cast<char*>(p)+k;n-=k;}
+#if defined(__APPLE__)
+    if(write){int noSigPipe=1;assert(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSigPipe,sizeof(noSigPipe))==0);}
+#endif
+    while(n){
+#if defined(__APPLE__)
+        constexpr int sendFlags=0; // SO_NOSIGPIPE is set on listener sockets below.
+#else
+        constexpr int sendFlags=MSG_NOSIGNAL;
+#endif
+        ssize_t k=write?send(fd,p,n,sendFlags):recv(fd,p,n,0);assert(k>0);p=static_cast<char*>(p)+k;n-=k;
+    }
 }
 int main(int argc,char** argv) {
     assert(argc==2);init();as.paramGetValueAtTime=valueAt;ms.setPersistentMessage=message;
@@ -117,16 +128,29 @@ int main(int argc,char** argv) {
     }
     std::string path="/tmp/ck-ofx-test-"+std::to_string(getpid())+".sock";
     effect.params["socket"].property.s[kOfxParamPropDefault]={path};
-    int listener=socket(AF_UNIX,SOCK_STREAM,0);assert(listener>=0);sockaddr_un addr{};addr.sun_family=AF_UNIX;strcpy(addr.sun_path,path.c_str());
+    int listener=socket(AF_UNIX,SOCK_STREAM,0);assert(listener>=0);
+#if defined(__APPLE__)
+    int noSigPipe=1;assert(setsockopt(listener,SOL_SOCKET,SO_NOSIGPIPE,&noSigPipe,sizeof(noSigPipe))==0);
+#endif
+    sockaddr_un addr{};addr.sun_family=AF_UNIX;strcpy(addr.sun_path,path.c_str());
+#if defined(__APPLE__)
+    addr.sun_len=static_cast<decltype(addr.sun_len)>(offsetof(sockaddr_un,sun_path)+path.size()+1);
+#endif
+    unlink(path.c_str()); // Remove a stale endpoint left by an interrupted prior test.
     assert(bind(listener,(sockaddr*)&addr,sizeof(addr))==0);assert(listen(listener,1)==0);
     // Fill the Unix accept backlog before rendering. A busy engine must be
-    // retried, not mistaken for a missing/stopped engine.
+    // retried, not mistaken for a missing/stopped engine. Darwin's Unix
+    // listener backlog behavior differs; this retry check is Linux-only.
+#if !defined(__APPLE__)
     std::array<int,2> blockers{};
     for (auto& c : blockers) { c=socket(AF_UNIX,SOCK_STREAM,0); assert(connect(c,(sockaddr*)&addr,sizeof(addr))==0); }
+#endif
     std::atomic<int> requests{0};
     std::thread server([&]{
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
+#if !defined(__APPLE__)
       for (int i=0;i<2;i++) { int c=accept(listener,nullptr,nullptr); assert(c>=0); close(c); }
+#endif
       for(int request=0;request<3;request++){
         int c=accept(listener,nullptr,nullptr);assert(c>=0);char header[32];exact(c,header,32);
         assert(!memcmp(header,"CK2REQ01",8));uint32_t bytes;memcpy(&bytes,header+28,4);assert(bytes==64);
@@ -140,7 +164,9 @@ int main(int argc,char** argv) {
     }});
     Property in;in.d[kOfxPropTime]={0};in.i[kOfxImageEffectPropRenderWindow]={7,11,9,13};
     assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatOK);assert(requests==1);
+#if !defined(__APPLE__)
     for (auto c : blockers) close(c);
+#endif
     assert(dst.pixels[0]>0.099f && dst.pixels[0]<0.101f);assert(dst.pixels[3]==0.25f);assert(dst.pixels[8]==-99.f);
     assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatOK);assert(requests==1); // cache hit
     effect.params["output"].property.i[kOfxParamPropDefault]={1};
@@ -152,7 +178,7 @@ int main(int argc,char** argv) {
     Property changed;changed.s[kOfxPropName]={"refresh"};call(kOfxActionInstanceChanged,&effect,&changed);
     assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatFailed);assert(lastError.find("wrong frame size")!=std::string::npos);
     server.join();close(listener);unlink(path.c_str());
-    assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatFailed);assert(lastError.find("Start Resolve engine")!=std::string::npos);
+    assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatFailed);assert(lastError.find("Start the OFX engine")!=std::string::npos);
     assert(releases==14); // All acquired images released on success and failure.
     in.s[kOfxImageEffectPropFieldToRender]={kOfxImageFieldLower};
     assert(call(kOfxImageEffectActionRender,&effect,&in)==kOfxStatFailed);

@@ -52,13 +52,13 @@ class FakeFactory:
 
 @pytest.fixture
 def worker(tmp_path):
-    # Keep AF_UNIX socket names safely below Linux's 108-byte limit.
+    # Keep AF_UNIX names below Darwin's 104-byte and Linux's 108-byte limits.
     run_dir = Path(tempfile.mkdtemp(prefix="ckw-", dir="/tmp"))
     sock_path = run_dir / "e.sock"
     calls = run_dir / "calls"
     release = run_dir / "release"
     started = run_dir / "started"
-    proc = multiprocessing.get_context("fork").Process(
+    proc = multiprocessing.get_context("spawn").Process(
         target=serve,
         args=(sock_path,),
         kwargs={"engine_factory": FakeFactory(str(calls), str(release), str(started))},
@@ -162,7 +162,7 @@ def test_bad_request_does_not_stop_server_and_valid_request_succeeds(worker):
 
 def test_second_worker_cannot_unlink_or_disrupt_first(worker):
     path, calls, release, started, proc = worker
-    second = multiprocessing.get_context("fork").Process(
+    second = multiprocessing.get_context("spawn").Process(
         target=serve,
         args=(path,),
         kwargs={"engine_factory": FakeFactory(str(calls), str(release), str(started))},

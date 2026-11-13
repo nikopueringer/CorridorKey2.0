@@ -6,7 +6,20 @@ import struct
 import pytest
 
 from ofx.protocol import (REQUEST, REQUEST_MAGIC, default_socket, parse_request,
-                          private_directory, receive)
+                          private_directory, receive, peer_uid, disconnected)
+
+
+def test_peer_credentials_and_non_consuming_disconnect_detection():
+    a, b = socket.socketpair()
+    with a, b:
+        assert peer_uid(a) == peer_uid(b) == os.getuid()
+        assert not disconnected(b)
+        a.sendall(b"frame")
+        assert not disconnected(b)
+        assert receive(b, 5) == b"frame"
+        assert not disconnected(b)
+        a.close()
+        assert disconnected(b)
 
 
 def packet(w=16, h=8, channels=4, flags=0, despill=0.5, size=None):

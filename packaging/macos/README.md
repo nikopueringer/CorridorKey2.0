@@ -1,9 +1,9 @@
-# Apple Silicon community desktop app
+# Apple Silicon community app and OpenFX
 
 This experimental app combines David Coelho's Qt desktop UI (PR #8) with
 Joseph Slinker and Parker Wightman's MPS support (PR #15). It is separate from
-Corridor Digital's paid plugin. The OpenFX bridge in this branch currently runs
-on **Linux only**; this Mac artifact is the standalone desktop app.
+Corridor Digital's paid plugin. The desktop app also supplies the local MPS
+worker for the separately packaged experimental macOS OpenFX bridge.
 
 ## Install and run
 
@@ -23,7 +23,7 @@ on **Linux only**; this Mac artifact is the standalone desktop app.
    temporary files. Models remain outside the app in
    `~/Library/Application Support/CorridorKey2.0`, so replacing the app does
    not redownload them. Interrupted downloads can be retried.
-5. Add a clip, select outputs and click Run. The queue uses the existing CLI
+5. Add a clip, select outputs and click **Run queue**. The queue uses the existing CLI
    and automatically selects MPS. Start with a short clip and automatic memory
    settings. Results go next to the source unless another destination is set.
 
@@ -34,6 +34,31 @@ PR #15's original storage policy. CUDA/MPS pixel parity is not claimed.
 
 Logs: `~/Library/Logs/CorridorKey2.0/launcher.log`. The desktop also shows
 per-clip processing errors. Model processing is local after installation.
+
+## Install OpenFX for Resolve
+
+Use the app and OFX archives from the same CI build. The OFX archive is
+`CorridorKeyMacOS-OFX-arm64.zip`; it does not include Python or model weights.
+
+1. Install the app and models as above. Quit Resolve before installing the effect.
+2. Extract the OFX archive and run `Install OFX.command`. It installs only the
+   community `CorridorKeyMacOS.ofx.bundle` into `/Library/OFX/Plugins`; macOS
+   requests an administrator password for that system folder. Existing bundles
+   are refused rather than silently replaced. The commercial plugin is untouched.
+3. Start CorridorKey and click **Start OFX engine**. Wait for the ready message.
+4. Restart Resolve and add **CorridorKey 2.0 Community** from the **Keyer** group.
+   Keep CorridorKey open while using the effect. Use the input-colour and alpha
+   setup described in the [OpenFX guide](../../ofx/README.md).
+
+The plugin is ad-hoc signed and not notarized, just like the app. It performs
+single-frame keying; use the standalone queue for temporal processing and hints.
+Maximum image size is 16,777,216 pixels and 8192 per side. An 8740×5760 source
+must be processed at a smaller timeline resolution or through the standalone
+queue using a supported input codec.
+
+macOS CI exercises the compiled bundle in a mock OFX host, same-user socket
+credentials and Python worker lifecycle/cancellation/recovery. An actual
+macOS Resolve render and full-model MPS inference have not yet been verified.
 
 ## Reproduce the app
 
@@ -57,7 +82,8 @@ launcher in self-test mode, checks CLI imports/help and runs CPU-compatible
 regression tests. This proves packaging and startup, **not full-model MPS
 inference or Resolve compatibility**. MPS-only tests may be skipped when the
 hosted runner has no usable Metal GPU. The workflow uploads the app archive
-only after those checks pass.
+only after those checks pass, and also compiles, tests, signs and packages the
+arm64 OFX bundle.
 
 The initial arm64 CI build passed its relocation/signature/UI checks and
 41 tests, including available Metal tests; 5 optional native-attention tests

@@ -1,4 +1,4 @@
-"""Own the optional Linux OFX worker without loading CUDA into the Qt UI."""
+"""Own the optional OFX worker without loading CUDA or Metal into the Qt UI."""
 from __future__ import annotations
 
 import os
@@ -20,7 +20,7 @@ class ResolveEngine(QObject):
         self._buffer = ""
 
     def start(self):
-        if self.proc is not None or not sys.platform.startswith("linux"):
+        if self.proc is not None or not (sys.platform.startswith("linux") or sys.platform == "darwin"):
             return
         proc = self.proc = QProcess(self)
         proc.setWorkingDirectory(str(ROOT))

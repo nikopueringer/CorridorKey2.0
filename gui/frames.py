@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -13,13 +16,20 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
 from .clips import frame_files
+from corridorkey.media_probe import validate_video
 
 _MAX_OPEN = 6
+_CUTOUT_CACHE_BYTES = 32 * 1024 * 1024
 
 
 def _srgb_encode(x: np.ndarray) -> np.ndarray:
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055)
+
+
+def _srgb_decode(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.04045, x / 12.92, np.power((x + 0.055) / 1.055, 2.4))
 
 
 def to_rgb8(img: np.ndarray, linear_float: bool) -> np.ndarray:
@@ -43,27 +53,81 @@ def to_rgb8(img: np.ndarray, linear_float: bool) -> np.ndarray:
     return np.ascontiguousarray(out[:, :, ::-1])
 
 
+def to_cutout_checker8(img: np.ndarray, checker_size: int = 16, linear: bool = False) -> np.ndarray:
+    """Composite a straight-alpha cutout over a checker in linear light.
+
+    Integer cutouts are display-coded sRGB (including 16-bit images); floating
+    point EXRs contain scene-linear RGB and alpha.
+    """
+    if img.ndim == 2:
+        img = img[:, :, None]
+    height, width = img.shape[:2]
+    rgb = np.empty((height, width, 3), dtype=np.uint8)
+    integer = np.issubdtype(img.dtype, np.integer)
+    scale = float(np.iinfo(img.dtype).max) if integer else 1.0
+    columns = np.arange(width, dtype=np.uint32)[None, :] // checker_size
+    # Work in row tiles: 8K 16-bit/float sources otherwise need several GB of
+    # temporary float arrays just to produce a display-sized RGB image.
+    for top in range(0, height, 128):
+        bottom = min(height, top + 128)
+        tile = img[top:bottom]
+        if tile.shape[2] == 1:
+            bgr = np.repeat(tile, 3, axis=2)
+            alpha = np.ones(tile.shape[:2], dtype=np.float32)
+        else:
+            bgr = tile[:, :, :3]
+            if tile.shape[2] >= 4:
+                alpha = tile[:, :, 3].astype(np.float32) / scale if integer else tile[:, :, 3].astype(np.float32)
+            else:
+                alpha = np.ones(tile.shape[:2], dtype=np.float32)
+        foreground = bgr.astype(np.float32) / scale
+        if integer and not linear:
+            foreground = _srgb_decode(foreground)
+        row = np.arange(top, bottom, dtype=np.uint32)[:, None] // checker_size
+        light = ((row + columns) & 1) == 0
+        checker = np.where(light[:, :, None], 0.72, 0.48).astype(np.float32)
+        alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
+        composite = foreground * alpha + _srgb_decode(checker) * (1.0 - alpha)
+        rgb[top:bottom] = (_srgb_encode(composite) * 255 + 0.5).astype(np.uint8)
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
 class FrameSource:
     """Random access to a video file or a folder of frames."""
 
-    def __init__(self, path: Path, linear_float: bool = True):
+    def __init__(self, path: Path, linear_float: bool = True, cutout: bool = False,
+                 sequence_fps: float = 24.0, cutout_linear: bool = False):
+        self.path = Path(path)
         self.linear_float = linear_float
-        self.files = frame_files(path) if path.is_dir() else None
+        self.cutout = cutout
+        self.cutout_linear = cutout_linear
+        self.files = frame_files(self.path) if self.path.is_dir() else None
         self.cap = None
+        self._ffmpeg: subprocess.Popen | None = None
+        self._ffmpeg_next = 0
+        self._cutout_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._interrupted = threading.Event()
         self._next = 0
         if self.files is None:
-            self.cap = cv2.VideoCapture(str(path))
+            validate_video(self.path)
+            self.cap = cv2.VideoCapture(str(self.path))
             if not self.cap.isOpened():
-                raise OSError(f"Cannot open {path.name}")
+                raise OSError(f"Cannot open {self.path.name}")
             self.count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 24.0)
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         else:
             if not self.files:
-                raise OSError(f"No frames in {path.name}")
+                raise OSError(f"No frames in {self.path.name}")
             self.count = len(self.files)
-            self.fps = 24.0
+            self.fps = sequence_fps
 
     def read(self, index: int) -> np.ndarray:
+        if self._interrupted.is_set():
+            raise OSError("Frame decode stopped")
+        if self.cutout and self.files is None:
+            return to_cutout_checker8(self._read_video_cutout(index), linear=self.cutout_linear)
         if self.files is not None:
             # imdecode copes with non-ASCII paths, which cv2.imread does not on Windows.
             data = np.fromfile(str(self.files[index]), dtype=np.uint8)
@@ -76,11 +140,83 @@ class FrameSource:
             img = img if ok else None
         if img is None:
             raise OSError(f"Cannot decode frame {index + 1}")
-        return to_rgb8(img, self.linear_float)
+        return (to_cutout_checker8(img, linear=self.cutout_linear)
+                if self.cutout else to_rgb8(img, self.linear_float))
+
+    def _read_video_cutout(self, index: int) -> np.ndarray:
+        if self._interrupted.is_set():
+            raise OSError("Frame decode stopped")
+        cached = self._cutout_cache.get(index)
+        if cached is not None:
+            self._cutout_cache.move_to_end(index)
+            return cached
+        if index < self._ffmpeg_next:
+            self._stop_ffmpeg()
+        if self._ffmpeg is None:
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg is None:
+                raise OSError("Cutout video preview needs ffmpeg on PATH to preserve alpha")
+            self._ffmpeg = subprocess.Popen(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(self.path),
+                 "-map", "0:v:0", "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+            )
+            if self._interrupted.is_set():
+                self._ffmpeg.terminate()
+            self._ffmpeg_next = 0
+        frame_size = self.width * self.height * 4
+        requested = None
+        while self._ffmpeg_next <= index:
+            if self._interrupted.is_set():
+                self._stop_ffmpeg()
+                raise OSError("Frame decode stopped")
+            parts = bytearray()
+            while len(parts) < frame_size:
+                chunk = self._ffmpeg.stdout.read(frame_size - len(parts))
+                if not chunk:
+                    break
+                parts.extend(chunk)
+            raw = bytes(parts)
+            if len(raw) != frame_size:
+                self._stop_ffmpeg()
+                raise OSError(f"ffmpeg could not decode cutout frame {self._ffmpeg_next + 1}")
+            bgra = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 4).copy()
+            current = self._ffmpeg_next
+            self._ffmpeg_next += 1
+            if current == index:
+                requested = bgra
+            self._cutout_cache[current] = bgra
+            self._cutout_cache.move_to_end(current)
+            while sum(frame.nbytes for frame in self._cutout_cache.values()) > _CUTOUT_CACHE_BYTES:
+                self._cutout_cache.popitem(last=False)
+        return self._cutout_cache.get(index, requested)
+
+    def _stop_ffmpeg(self) -> None:
+        proc, self._ffmpeg = self._ffmpeg, None
+        if proc is None:
+            return
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
+        self._ffmpeg_next = 0
 
     def close(self) -> None:
+        self._stop_ffmpeg()
         if self.cap is not None:
             self.cap.release()
+
+    def interrupt(self) -> None:
+        """Interrupt the FFmpeg reader; VideoCapture stays owned by its reader thread."""
+        self._interrupted.set()
+        proc = self._ffmpeg
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
 
 class FrameLoader(QObject):
@@ -93,29 +229,55 @@ class FrameLoader(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cond = threading.Condition()
-        self._request: tuple[str, int, bool] | None = None
+        self._request: tuple[str, int, bool, bool, float, bool, int] | None = None
         self._release = False
         self._alive = True
         self._sources: dict[str, FrameSource] = {}
+        self._active_lock = threading.Lock()
+        self._active_source: FrameSource | None = None
+        self._active_generation: int | None = None
+        self._shutdown_event = threading.Event()
+        self._generation = 0
         self._thread = threading.Thread(target=self._run, name="frame-loader", daemon=True)
         self._thread.start()
 
-    def request(self, path: Path, index: int, linear_float: bool = True) -> None:
+    def request(self, path: Path, index: int, linear_float: bool = True,
+                cutout: bool = False, sequence_fps: float = 24.0,
+                cutout_linear: bool = False) -> None:
         with self._cond:
-            self._request = (str(path), index, linear_float)
+            self._generation += 1
+            generation = self._generation
+            self._request = (str(path), index, linear_float, cutout,
+                             sequence_fps, cutout_linear, generation)
+            self._interrupt_active_before(generation)
             self._cond.notify()
 
     def release(self) -> None:
         """Close every open file, e.g. before infer.py rewrites a clip's outputs."""
         with self._cond:
             self._release = True
+            self._generation += 1
+            self._request = None
+            generation = self._generation
+            self._interrupt_active_before(generation)
             self._cond.notify()
 
     def shutdown(self) -> None:
+        self._shutdown_event.set()
         with self._cond:
             self._alive = False
+            self._generation += 1
+            self._request = None
+            generation = self._generation
+            self._interrupt_active_before(generation)
             self._cond.notify()
-        self._thread.join(timeout=2)
+        self._thread.join(timeout=1.8)
+
+    def _interrupt_active_before(self, generation: int) -> None:
+        with self._active_lock:
+            if (self._active_source is not None and self._active_generation is not None and
+                    self._active_generation < generation):
+                self._active_source.interrupt()
 
     def _run(self) -> None:
         while True:
@@ -135,18 +297,48 @@ class FrameLoader(QObject):
         for source in self._sources.values():
             source.close()
 
-    def _load(self, path: str, index: int, linear_float: bool) -> None:
+    def _load(self, path: str, index: int, linear_float: bool, cutout: bool,
+              sequence_fps: float, cutout_linear: bool, generation: int) -> None:
         try:
+            if self._is_stale(generation):
+                return
             source = self._sources.get(path)
+            if (source is not None and (source.linear_float != linear_float or
+                    source.cutout != cutout or source.cutout_linear != cutout_linear or
+                    source._interrupted.is_set())):
+                source.close()
+                del self._sources[path]
+                source = None
             if source is None:
-                source = self._sources[path] = FrameSource(Path(path), linear_float)
+                source = self._sources[path] = FrameSource(Path(path), linear_float,
+                                                          cutout, sequence_fps, cutout_linear)
                 if len(self._sources) > _MAX_OPEN:
                     oldest = next(iter(self._sources))
                     self._sources.pop(oldest).close()
+            elif source.files is not None:
+                source.fps = sequence_fps
+            with self._active_lock:
+                self._active_source = source
+                self._active_generation = generation
+            if self._is_stale(generation):
+                source.interrupt()
+                return
             index = max(0, min(index, source.count - 1))
             rgb = source.read(index)
+            if self._is_stale(generation):
+                return
             h, w, _ = rgb.shape
             image = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
             self.loaded.emit(path, index, source.count, source.fps, image)
         except Exception as exc:  # a bad frame must not kill the loader thread
-            self.failed.emit(path, str(exc))
+            if not self._is_stale(generation):
+                self.failed.emit(path, str(exc))
+        finally:
+            with self._active_lock:
+                if self._active_generation == generation:
+                    self._active_source = None
+                    self._active_generation = None
+
+    def _is_stale(self, generation: int) -> bool:
+        with self._cond:
+            return self._shutdown_event.is_set() or generation != self._generation

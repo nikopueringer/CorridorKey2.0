@@ -16,12 +16,12 @@ Led by Ale Alvaro, we now have a plugin (and stand-alone app) available for almo
 Any business or research inquiries for Zac can be directed to z.brooks.harris@gmail.com
 
 
-## Community desktop builds and Linux Resolve OpenFX (experimental)
+## Community desktop builds and Resolve OpenFX (experimental)
 
-This branch continues the desktop GUI from PR #8 and adds a Linux x86-64
-OpenFX bridge for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
+This branch continues the desktop GUI from PR #8 and adds Linux x86-64 and Apple Silicon
+OpenFX bridges for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
 The GUI retains temporal processing and hints; OFX currently keys individual
-frames through a separate local CUDA worker. This community build is separate
+frames through a separate local CUDA or MPS worker. This community build is separate
 from the official paid plugin. An Apple Silicon desktop app with bundled Python
 and the reviewed MPS backend is also available: [Mac build and usage](packaging/macos/README.md).
 See the [review of all upstream pull requests](docs/PR_REVIEW.md) for integration decisions.
@@ -151,6 +151,17 @@ python -m gui.shortcut
 
 Companion hint files are picked up the same way the drag-and-drop launcher
 finds them, and each clip's hint can be changed in the inspector.
+
+Click **Run queue** to render standalone clips. **Start OFX engine** serves the
+Resolve plugin. The viewer shows the decoded video FPS, frame count, size and
+duration; **Sequence FPS** only controls folders of still frames. The **Cutout**
+tab displays straight alpha over a checker, including ProRes 4444 output.
+
+Some DNxHR 444 files use variable Adaptive Color Transform (ACT), which the
+FFmpeg decoder does not support. Such files can otherwise decode with a strong
+pink/green cast despite returning frames successfully. The app and CLI reject
+this known decoder error. Export those clips from Resolve as ProRes 4444 or EXR,
+or use the OFX effect within Resolve at a supported processing resolution.
 
 ## Quick Start
 
