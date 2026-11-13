@@ -374,13 +374,6 @@ def reserve_activation_arena(nbytes: int) -> int:
     return nbytes
 
 
-# Fixed headroom floor for other GPU processes and allocator slack.
-_VRAM_HEADROOM_GB = 1.5
-_VRAM_HEADROOM_FRAC = 0.05
-
-
-def _vram_headroom_gb(total_gb: float) -> float:
-    return max(_VRAM_HEADROOM_GB, _VRAM_HEADROOM_FRAC * total_gb)
 
 
 def _read_vram_budget_gb() -> tuple[float, float]:
