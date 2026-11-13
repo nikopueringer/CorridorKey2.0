@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: community-builds-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos-app:
     name: Apple Silicon app
