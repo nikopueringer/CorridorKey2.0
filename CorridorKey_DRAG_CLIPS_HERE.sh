@@ -3,7 +3,9 @@
 # and drop the clip into the terminal when asked.
 cd "$(dirname "$0")" || exit 1
 
-if [ -x "venv/bin/python" ]; then
+if [ -x ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+elif [ -x "venv/bin/python" ]; then
     PYTHON="venv/bin/python"
 else
     PYTHON="python3"

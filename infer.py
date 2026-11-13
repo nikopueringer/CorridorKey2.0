@@ -17,6 +17,7 @@ from corridorkey.runtime import (
     RuntimePaths,
     WriterConfig,
     load_model,
+    resolve_device,
     run_inference,
 )
 from corridorkey.video_io import require_ffmpeg
@@ -115,10 +116,13 @@ def main():
     ap.add_argument("--low_vram_swin_window_batch", type=int, default=16)
     ap.add_argument("--low_vram_full_attn_query_chunk_tokens", type=int,
                     default=2048)
+    ap.add_argument("--device", default="auto",
+                    choices=("auto", "cuda", "mps", "cpu"),
+                    help="Execution device (default: auto).")
     args = ap.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
+    device = resolve_device(args.device)
+    print(f"Using device: {device}")
     require_ffmpeg(args.ffmpeg_bin)
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
@@ -166,7 +170,7 @@ def main():
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
     )
-    model = load_model(paths, device="cuda")
+    model = load_model(paths, device=device)
     run_inference(
         model,
         args.input,

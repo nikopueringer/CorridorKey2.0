@@ -13,6 +13,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--package_root", default=str(Path(__file__).resolve().parents[1]))
     ap.add_argument("--load_model", action="store_true")
+    ap.add_argument("--device", default="auto", choices=("auto", "cuda", "mps", "cpu"))
     args = ap.parse_args()
 
     root = Path(args.package_root).resolve()
@@ -20,7 +21,7 @@ def main():
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    from corridorkey.runtime import RuntimePaths, load_model, load_runtime_checkpoint
+    from corridorkey.runtime import RuntimePaths, load_model, load_runtime_checkpoint, resolve_device
 
     paths = RuntimePaths.from_package(root)
     paths.validate()
@@ -38,9 +39,8 @@ def main():
     print(f"checkpoint ok: {paths.weights} ({paths.weights.stat().st_size / 1e9:.2f} GB)")
     print(f"state tensors: {len(state)}")
     if args.load_model:
-        if not torch.cuda.is_available():
-            raise RuntimeError("--load_model requires CUDA")
-        model = load_model(paths, device="cuda")
+        device = resolve_device(args.device)
+        model = load_model(paths, device=device)
         print(f"model ok: d16={model.stage1.d_16}, "
               f"cradio={model.stage1.cradio_dim}, "
               f"moge={model.stage1.moge_dim}, "
