@@ -5,15 +5,16 @@ Joseph Slinker and Parker Wightman's MPS support (PR #15). It is separate from
 Corridor Digital's paid plugin. The desktop app also supplies the local MPS
 worker for the separately packaged experimental macOS OpenFX bridge.
 
-**Current validation status:** native macOS 15 (`a66ca8e`) passed packaging,
-relocation and all 203 applicable Python tests. The same revision on macOS 26
-passed 181 tests but failed 22 CPU-reference comparisons. Intermediate traces
-isolated omitted Linear bias, matching
-[PyTorch issue #188438](https://github.com/pytorch/pytorch/issues/188438), rather
-than a discrepancy in the 81 passing SDPA probes or 36 passing RMSNorm probes.
-The runtime now adds Linear bias separately on MPS, including foundation layers,
-following the upstream workaround. This change requires a fresh successful
-native run; existing macOS 15 artifacts do not validate macOS 26.
+**Current validation status:** native macOS 15 and 26 both passed app/OFX
+packaging, signatures, relocation, launcher and numerical tests at `b4d6054`
+with **219 Python tests passed and 8 skipped on each OS**
+([verified build](https://github.com/dimmmmmmmer/CorridorKey2.0/actions/runs/43533107887)).
+This includes the correction for omitted Linear bias on M1/macOS 26
+([PyTorch issue #188438](https://github.com/pytorch/pytorch/issues/188438)):
+the runtime adds bias separately on MPS, including foundation layers, while
+retaining the original CPU/CUDA path. Earlier `a66ca8e` macOS 15 artifacts do
+not contain this correction. Full-model inference and Resolve rendering on a
+physical Mac remain unverified.
 Use only matching artifacts from
 a successful [community build](https://github.com/dimmmmmmmer/CorridorKey2.0/actions/workflows/community-builds.yml).
 
