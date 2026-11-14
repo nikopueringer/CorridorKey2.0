@@ -19,9 +19,11 @@ import argparse
 import base64
 import hashlib
 import shutil
+import ssl
 import urllib.request
 from pathlib import Path
 
+import certifi
 from huggingface_hub import hf_hub_download, snapshot_download
 
 CORRIDORKEY_REPO = "nikopueringer/CorridorKey2.0"
@@ -36,6 +38,18 @@ MOGE_REVISION = "ca5f0e07ff01d3e5a364c1d954ed12ee1814b368"
 RVM_FILE = "pretrain_rvm_small16_256_204031069.npz"
 RVM_URL = f"https://storage.googleapis.com/representations4d/checkpoints/{RVM_FILE}"
 RVM_MD5_B64 = "ZJb6kj8+tasiJbVeplXu7Q=="
+
+
+def _verified_ssl_context() -> ssl.SSLContext:
+    """Keep platform trust roots and add certifi only if the default CA file is absent."""
+    context = ssl.create_default_context()
+    default_paths = ssl.get_default_verify_paths()
+    cafile = default_paths.cafile
+    if not cafile or not Path(cafile).is_file():
+        # load_verify_locations augments the context initialized above, retaining
+        # any system or custom capath roots already loaded by create_default_context.
+        context.load_verify_locations(cafile=certifi.where())
+    return context
 
 
 def _md5_b64(path: Path) -> str:
@@ -75,7 +89,8 @@ def download_rvm(root: Path) -> None:
     print(f"[rvm] {RVM_URL}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".part")
-    with urllib.request.urlopen(RVM_URL) as response, open(tmp, "wb") as f:
+    context = _verified_ssl_context()
+    with urllib.request.urlopen(RVM_URL, context=context) as response, open(tmp, "wb") as f:
         shutil.copyfileobj(response, f, length=1 << 20)
     if _md5_b64(tmp) != RVM_MD5_B64:
         tmp.unlink()

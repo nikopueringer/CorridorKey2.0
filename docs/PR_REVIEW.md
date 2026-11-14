@@ -27,6 +27,32 @@ The current branch retains the relevant original commits in history. Integrated 
 | [#20](https://github.com/nikopueringer/CorridorKey2.0/pull/20) | Open | LUT preprocessing for unscaled uint8 frames | **Integrated.** Equivalence tests compare LUT outputs to the original float path; a narrow frame-directory gate preserves prior behavior when adjusted metadata is passed directly. Original commit retained: `6be9d5f`. |
 | [#21](https://github.com/nikopueringer/CorridorKey2.0/pull/21) | Open | Consolidation branch labelled “Do Not Merge” | Do not merge wholesale; use as a map to separately reviewed PRs only. |
 
+## Follow-up review: 2026-11-14
+
+[PR #23](https://github.com/nikopueringer/CorridorKey2.0/pull/23), by
+`philipmiesbauer`, was reviewed at `d753c8605f7673e69e315357c810500f9016495e`.
+Its five-file change adds automatic CUDA/MPS selection, device-aware runtime
+helpers, a CPU fallback for non-divisible area resize, an explicit `--device`
+option, an RVM-download certificate fallback, and `.venv` launcher preference.
+
+- **Adapted:** the certificate fallback for macOS Python installations without
+  a default CA file. Our downloader starts with the verified platform context
+  and adds certifi roots, preserving existing system/custom trust directories.
+  `certifi` is an explicit dependency. Offline tests cover trust retention,
+  the context passed to `urlopen`, and checkpoint checksum validation.
+- **Already covered:** automatic MPS selection, device-aware operations, area
+  resize fallback and `.venv` discovery are present through the existing Mac
+  integration. There is no reason to replace them wholesale.
+- **Not adopted:** its MPS memory planner treats the full recommended working
+  set as available and does not include our conservative budget or spatial
+  attention batching. Explicit device/CPU selection is a separate feature;
+  its fixed 8 GB CPU budget is not an available-memory measurement.
+- **Validation limit:** the author reports weight downloads, model loading and
+  successful alpha/foreground video inference. No automated checks were
+  attached to the reviewed head, and no tests, GUI, app packaging, OFX or
+  attention implementation changes are included. This PR does not resolve our
+  CPU-reference attention failures on native macOS 26.
+
 ## Decision notes
 
 - The main safe candidates adopted are focused correctness, memory, GUI and platform changes: #4, #6, #8, #9, #15 and #20.

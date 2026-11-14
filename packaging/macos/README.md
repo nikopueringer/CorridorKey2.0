@@ -5,11 +5,12 @@ Joseph Slinker and Parker Wightman's MPS support (PR #15). It is separate from
 Corridor Digital's paid plugin. The desktop app also supplies the local MPS
 worker for the separately packaged experimental macOS OpenFX bridge.
 
-**Current validation status:** expanded CPU-reference tests found an MPS attention
-discrepancy in the previous macOS 26 build. A candidate correction is included,
-but its native numerical validation is still pending. App and OFX compilation,
-signatures, relocation and launcher checks passed on that earlier build; these
-alone do not establish correct Metal output. Use only matching artifacts from
+**Current validation status:** expanded CPU-reference tests still detect an MPS
+attention discrepancy in the latest native macOS 26 run (`bd25b28`). The previous
+layout correction did not resolve it. App and OFX compilation, signatures,
+relocation and launcher checks passed; these alone do not establish correct
+Metal output. Operator diagnostics are being used to isolate the failure.
+Use only matching artifacts from
 a successful [community build](https://github.com/dimmmmmmmer/CorridorKey2.0/actions/workflows/community-builds.yml).
 
 ## Install and run

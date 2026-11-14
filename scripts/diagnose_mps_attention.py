@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Collect MPS SDPA layout/mask diagnostics against CPU references.
+"""Collect MPS attention and module-stage diagnostics against CPU references.
 
 Inputs are generated deterministically on CPU and copied to MPS. Every case
 records MPS SDPA versus both CPU SDPA and an explicit fp32 softmax reference.
+Module traces and isolated RMSNorm probes identify divergence outside SDPA.
 This is diagnostic-only: backend errors and numerical differences are recorded
 without stopping later cases, and the script exits successfully after a run.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import platform
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -65,6 +68,8 @@ def compare(actual: torch.Tensor, expected: torch.Tensor) -> dict:
 
 def tensor_layout(tensor: torch.Tensor) -> dict:
     return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
         "stride": list(tensor.stride()),
         "storage_offset": tensor.storage_offset(),
         "is_contiguous": tensor.is_contiguous(),
@@ -135,6 +140,175 @@ def run_case(*, packed_cpu: torch.Tensor, packed_mps: torch.Tensor,
     return result
 
 
+def _trace_module(module, x, kwargs) -> tuple[dict, str | None]:
+    """Record actual forward intermediates; hooks never replace tensor values."""
+    from corridorkey import blocks
+
+    trace = {}
+    handles = []
+    counters = {"rotary": 0, "sdpa": 0}
+
+    def save(name, tensor):
+        if isinstance(tensor, torch.Tensor):
+            trace[name] = {
+                "layout": tensor_layout(tensor),
+                "value": tensor.detach().cpu().clone(),
+            }
+
+    def hook(name):
+        def capture(_module, inputs, output):
+            for index, tensor in enumerate(inputs):
+                save(f"{name}.input{index}", tensor)
+            if isinstance(output, tuple):
+                for index, tensor in enumerate(output):
+                    save(f"{name}.output{index}", tensor)
+            else:
+                save(f"{name}.output", output)
+        return capture
+
+    for name in ("qkv.qkv", "qkv", "q_norm", "k_norm", "attn_gate.proj", "proj"):
+        child = dict(module.named_modules()).get(name)
+        if child is not None:
+            handles.append(child.register_forward_hook(hook(name)))
+
+    original_rotary = blocks.apply_rotary
+    original_sdpa = F.scaled_dot_product_attention
+
+    def rotary(values, cos, sin):
+        index = counters["rotary"]
+        counters["rotary"] += 1
+        for suffix, tensor in (("input", values), ("cos", cos), ("sin", sin)):
+            save(f"rotary{index}.{suffix}", tensor)
+        output = original_rotary(values, cos, sin)
+        save(f"rotary{index}.output", output)
+        return output
+
+    def sdpa(q, k, v, *args, **kw):
+        index = counters["sdpa"]
+        counters["sdpa"] += 1
+        for suffix, tensor in (("q", q), ("k", k), ("v", v)):
+            save(f"sdpa{index}.{suffix}", tensor)
+        save(f"sdpa{index}.mask", kw.get("attn_mask", args[0] if args else None))
+        output = original_sdpa(q, k, v, *args, **kw)
+        save(f"sdpa{index}.output", output)
+        return output
+
+    error = None
+    try:
+        with torch.inference_mode(), patch.object(blocks, "apply_rotary", rotary), \
+                patch.object(F, "scaled_dot_product_attention", sdpa):
+            save("module.input", x)
+            save("module.output", module(x, **kwargs))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        for handle in handles:
+            handle.remove()
+    return trace, error
+
+
+def collect_module_diagnostics(actual_device: str = "mps") -> list[dict]:
+    """Find the first divergent operation in the exact failing module shapes."""
+    # The script is also invoked by absolute path from the relocated app.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from corridorkey.blocks import CSwinAttention2D, SwinAttention2D
+
+    results = []
+    for kind, seed, shape in (
+        ("swin_padding", 7, (2, 9, 11, 32)),
+        ("swin_single_explicit", 17, (1, 4, 4, 32)),
+        ("cswin", 8, (2, 7, 11, 32)),
+        ("swin_padding_head64", 7, (2, 9, 11, 256)),
+        ("swin_single_explicit_head64", 17, (1, 4, 4, 256)),
+        ("cswin_head64", 8, (2, 7, 11, 256)),
+    ):
+        torch.manual_seed(seed)
+        dim = shape[-1]
+        module = (CSwinAttention2D(dim, 4) if kind.startswith("cswin")
+                  else SwinAttention2D(dim, 4, 4)).eval()
+        torch.nn.init.normal_(module.proj.weight, std=0.1)
+        x = torch.randn(shape, device="cpu")
+        kwargs = {}
+        if kind.startswith("swin_single_explicit"):
+            mask = torch.ones(1, 16, 16, dtype=torch.bool)
+            mask[:, :, -3:] = False
+            kwargs["attn_mask"] = mask
+        reference_module = copy.deepcopy(module)
+        reference, cpu_error = _trace_module(reference_module, x, kwargs)
+        actual_module = module.to(actual_device).eval()
+        actual, actual_error = _trace_module(
+            actual_module, x.to(actual_device),
+            {key: value.to(actual_device) for key, value in kwargs.items()})
+        result = {"case": kind, "actual_device": actual_device,
+                  "head_dim": dim // 4,
+                  "cpu_error": cpu_error, "actual_error": actual_error,
+                  "first_divergent_stage": None, "stages": []}
+        result["parameters_and_buffers"] = {
+            name: compare(value.detach().cpu(), dict(
+                list(reference_module.named_parameters()) + list(reference_module.named_buffers()))[name].detach())
+            for name, value in list(actual_module.named_parameters()) + list(actual_module.named_buffers())
+        }
+        for name, expected in reference.items():
+            observed = actual.get(name)
+            stage = {"name": name, "cpu_layout": expected["layout"]}
+            if observed is None:
+                stage["missing_actual_stage"] = True
+            else:
+                stage["actual_layout"] = observed["layout"]
+                a, b = observed["value"], expected["value"]
+                # Explicit-mask CPU SDPA keeps a singleton image/window axis;
+                # the MPS route flattens it. Compare equal logical sequences.
+                if a.shape != b.shape and a.numel() == b.numel():
+                    stage["reshaped_for_compare"] = True
+                    a = a.reshape(b.shape)
+                if a.shape != b.shape:
+                    stage["shape_mismatch"] = True
+                else:
+                    stage["comparison"] = compare(a, b)
+            if (result["first_divergent_stage"] is None and
+                    not stage.get("comparison", {}).get("allclose_1e-5_1e-4", False)):
+                result["first_divergent_stage"] = name
+            result["stages"].append(stage)
+        results.append(result)
+    return results
+
+
+def collect_norm_diagnostics(actual_device: str = "mps") -> list[dict]:
+    """Separate norm math from preceding projection and inference dispatch."""
+    results = []
+    generator = torch.Generator(device="cpu").manual_seed(8383)
+    for batch, dim in ((1, 8), (2, 8), (2, 64)):
+        packed = torch.randn(batch, 3, 4, 16, dim, generator=generator)
+        on_device = packed.to(actual_device)
+        weight = torch.randn(dim, generator=generator) * .2 + 1
+        device_weight = weight.to(actual_device).requires_grad_(True)
+        for slot in (0, 1):
+            raw = on_device[:, slot]
+            cpu_input = packed[:, slot]
+            reference = cpu_input * torch.rsqrt(cpu_input.square().mean(-1, keepdim=True) + 1e-6) * weight
+            for layout in ("packed_view", "contiguous", "zero_offset_clone"):
+                values = (raw if layout == "packed_view" else raw.contiguous()
+                          if layout == "contiguous" else raw.clone(memory_format=torch.contiguous_format))
+                for mode in ("inference", "grad_enabled"):
+                    result = {"batch": batch, "head_dim": dim, "packed_slot": slot,
+                              "layout": layout, "input_layout": tensor_layout(values),
+                              "mode": mode, "actual_device": actual_device}
+                    try:
+                        context = torch.inference_mode() if mode == "inference" else torch.enable_grad()
+                        with context:
+                            actual = F.rms_norm(values, (dim,), device_weight, 1e-6)
+                        result["functional_vs_cpu_math"] = compare(actual.detach().cpu(), reference)
+                        with torch.inference_mode():
+                            explicit = (values.float() * torch.rsqrt(
+                                values.float().square().mean(-1, keepdim=True) + 1e-6)
+                                * device_weight.float())
+                        result["explicit_vs_cpu_math"] = compare(explicit.cpu(), reference)
+                    except Exception as exc:
+                        result["error"] = f"{type(exc).__name__}: {exc}"
+                    results.append(result)
+    return results
+
+
 def collect() -> dict:
     report = {
         "metadata": {
@@ -179,6 +353,12 @@ def collect() -> dict:
             mask_encoding=encoding,
             mask_layout=layout,
         ))
+    for key, diagnostic in (("module_stages", collect_module_diagnostics),
+                            ("rms_norm", collect_norm_diagnostics)):
+        try:
+            report[key] = diagnostic()
+        except Exception as exc:
+            report[key] = {"error": f"{type(exc).__name__}: {exc}"}
     report["status"] = "complete"
     return report
 

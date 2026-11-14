@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,12 +111,21 @@ def test_abort_fences_full_queue_and_kills_encoder_ignoring_sigterm(tmp_path):
         pytest.skip("test uses POSIX process signals")
     marker = tmp_path / "encoder-started"
     fake_ffmpeg = tmp_path / "ffmpeg-ignores-term"
-    fake_ffmpeg.write_text(
-        f"#!{sys.executable}\n"
+    # A relocated macOS app has spaces in its Python path. Kernels cannot
+    # parse a quoted interpreter path in a shebang, so launch it via sh.
+    python_dir = tmp_path / "Python with spaces"
+    python_dir.mkdir()
+    python_alias = python_dir / "python"
+    python_alias.symlink_to(sys.executable)
+    encoder_code = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         f"open({str(marker)!r}, 'w').close()\n"
         "while True: time.sleep(0.1)\n"
+    )
+    fake_ffmpeg.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(str(python_alias)) + " -c "
+        + shlex.quote(encoder_code) + ' "$@"\n'
     )
     fake_ffmpeg.chmod(0o755)
     writer = ThreadedVideoWriter(
