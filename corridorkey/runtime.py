@@ -17,6 +17,7 @@ from . import color_utils as cu
 from .model import CorridorKeyV3
 from .device import area_resize, empty_cache, memory_budget_gb, model_device, synchronize
 from .mps_attention import available as native_attention_available
+from .mps_linear import preserve_mps_linear_bias
 from .outputs import OutputSnapshot, OutputTransaction, contained_path, merge_manifest, validate_destination
 from .video_io import (
     ExrSequenceWriter,
@@ -307,6 +308,9 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
     print(f"  loaded weights; omitted frozen foundation tensors={len(missing)}")
     model.eval()
     model.requires_grad_(False)
+    if torch.device(device).type == "mps":
+        count = preserve_mps_linear_bias(model)
+        print(f"  Metal Linear bias compatibility enabled for {count} layers")
     # PR #9's storage optimization was validated on CUDA. Preserve PR #15's
     # original storage policy on Metal until same-device parity is established.
     if torch.device(device).type == "cuda":

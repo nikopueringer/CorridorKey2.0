@@ -3,6 +3,7 @@ import copy
 
 import pytest
 import torch
+from corridorkey.mps_linear import preserve_mps_linear_bias
 
 from corridorkey.blocks import (
     CSwinAttention2D,
@@ -30,6 +31,7 @@ def test_swin_batching_preserves_masked_results(device, window_batch, mask_kind)
     # The production initialization is zero; a zero projection would conceal
     # incorrect masking or chunk placement in this test.
     torch.nn.init.normal_(module.proj.weight, std=0.1)
+    torch.nn.init.normal_(module.proj.bias, std=0.1)
     # B=2 yields 18 windows, so a batch size of five crosses the boundary
     # between the two images. Zero and 32 exercise the unbatched paths.
     x_cpu = torch.randn(2, 9, 11, 32, device="cpu")
@@ -49,6 +51,7 @@ def test_swin_batching_preserves_masked_results(device, window_batch, mask_kind)
         reference = reference_module(x_cpu, **kwargs_cpu)
 
         actual_module = module.to(device).eval()
+        preserve_mps_linear_bias(actual_module)
         x_device = x_cpu.to(device)
         kwargs_device = _copy_kwargs(kwargs_cpu, device)
         actual_module.inference_window_batch = window_batch
@@ -66,12 +69,14 @@ def test_swin_single_window_explicit_mask_matches_cpu(device, window_batch):
     torch.manual_seed(17)
     module = SwinAttention2D(32, 4, 4).eval()
     torch.nn.init.normal_(module.proj.weight, std=0.1)
+    torch.nn.init.normal_(module.proj.bias, std=0.1)
     x_cpu = torch.randn(1, 4, 4, 32, device="cpu")
     mask_cpu = torch.ones(1, 16, 16, dtype=torch.bool, device="cpu")
     mask_cpu[:, :, -3:] = False
     with torch.inference_mode():
         reference = copy.deepcopy(module).cpu().eval()(x_cpu, attn_mask=mask_cpu)
         actual_module = module.to(device).eval()
+        preserve_mps_linear_bias(actual_module)
         actual_module.inference_window_batch = window_batch
         actual = actual_module(x_cpu.to(device), attn_mask=mask_cpu.to(device)).cpu()
     assert torch.isfinite(actual).all()
@@ -86,10 +91,12 @@ def test_cswin_strip_batches_preserve_results(device, strip_batch):
     torch.manual_seed(8)
     module = CSwinAttention2D(32, 4).eval()
     torch.nn.init.normal_(module.proj.weight, std=0.1)
+    torch.nn.init.normal_(module.proj.bias, std=0.1)
     x_cpu = torch.randn(2, 7, 11, 32, device="cpu")
     with torch.inference_mode():
         reference = copy.deepcopy(module).cpu().eval()(x_cpu)
         actual_module = module.to(device).eval()
+        preserve_mps_linear_bias(actual_module)
         actual_module.inference_strip_batch = strip_batch
         actual = actual_module(x_cpu.to(device)).cpu()
     assert torch.isfinite(actual).all()

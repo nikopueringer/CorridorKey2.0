@@ -212,6 +212,7 @@ def collect_module_diagnostics(actual_device: str = "mps") -> list[dict]:
     # The script is also invoked by absolute path from the relocated app.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from corridorkey.blocks import CSwinAttention2D, SwinAttention2D
+    from corridorkey.mps_linear import preserve_mps_linear_bias
 
     results = []
     for kind, seed, shape in (
@@ -227,6 +228,7 @@ def collect_module_diagnostics(actual_device: str = "mps") -> list[dict]:
         module = (CSwinAttention2D(dim, 4) if kind.startswith("cswin")
                   else SwinAttention2D(dim, 4, 4)).eval()
         torch.nn.init.normal_(module.proj.weight, std=0.1)
+        torch.nn.init.normal_(module.proj.bias, std=0.1)
         x = torch.randn(shape, device="cpu")
         kwargs = {}
         if kind.startswith("swin_single_explicit"):
@@ -236,6 +238,7 @@ def collect_module_diagnostics(actual_device: str = "mps") -> list[dict]:
         reference_module = copy.deepcopy(module)
         reference, cpu_error = _trace_module(reference_module, x, kwargs)
         actual_module = module.to(actual_device).eval()
+        preserve_mps_linear_bias(actual_module)
         actual, actual_error = _trace_module(
             actual_module, x.to(actual_device),
             {key: value.to(actual_device) for key, value in kwargs.items()})

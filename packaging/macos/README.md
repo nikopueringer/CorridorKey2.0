@@ -5,11 +5,15 @@ Joseph Slinker and Parker Wightman's MPS support (PR #15). It is separate from
 Corridor Digital's paid plugin. The desktop app also supplies the local MPS
 worker for the separately packaged experimental macOS OpenFX bridge.
 
-**Current validation status:** expanded CPU-reference tests still detect an MPS
-attention discrepancy in the latest native macOS 26 run (`bd25b28`). The previous
-layout correction did not resolve it. App and OFX compilation, signatures,
-relocation and launcher checks passed; these alone do not establish correct
-Metal output. Operator diagnostics are being used to isolate the failure.
+**Current validation status:** native macOS 15 (`a66ca8e`) passed packaging,
+relocation and all 203 applicable Python tests. The same revision on macOS 26
+passed 181 tests but failed 22 CPU-reference comparisons. Intermediate traces
+isolated omitted Linear bias, matching
+[PyTorch issue #188438](https://github.com/pytorch/pytorch/issues/188438), rather
+than a discrepancy in the 81 passing SDPA probes or 36 passing RMSNorm probes.
+The runtime now adds Linear bias separately on MPS, including foundation layers,
+following the upstream workaround. This change requires a fresh successful
+native run; existing macOS 15 artifacts do not validate macOS 26.
 Use only matching artifacts from
 a successful [community build](https://github.com/dimmmmmmmer/CorridorKey2.0/actions/workflows/community-builds.yml).
 
@@ -88,7 +92,10 @@ and macOS 26 arm64 runners with a macOS 15 deployment target. It extracts the zi
 different directory containing spaces,
 removes the original build directory, verifies signatures, starts the native
 launcher in self-test mode, checks CLI imports/help and runs CPU-compatible
-regression tests, plus CPU-reference attention checks. Release verification
+regression tests, plus CPU-reference attention checks. It also checks biased
+Linear operations in FP32 and BF16 autocast, with inference
+and gradients, and preserves CPU/CUDA behavior and checkpoint state keys.
+Release verification
 requires arm64 and an available Metal device.
 An attention diagnostic report is retained even if a check fails. This proves
 packaging and startup, **not full-model MPS
