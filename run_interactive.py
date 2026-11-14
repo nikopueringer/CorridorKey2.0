@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
+from corridorkey.outputs import default_output_dir
 
 DEFAULT_TEMP_DIR = str(Path(tempfile.gettempdir()) / "corridorkey_v2")
 
@@ -498,10 +499,9 @@ def main():
                     print(f"Running clip in {Colors.YELLOW}No Hint{Colors.RESET} mode.")
 
             # Resolve output directory
-            if custom_output_parent:
-                output_dir = str(Path(custom_output_parent) / f"out_{clip.stem}").replace("\\", "/")
-            else:
-                output_dir = str(clip.parent / f"out_{clip.stem}").replace("\\", "/")
+            parent = Path(custom_output_parent) if custom_output_parent else clip.parent
+            output_dir = default_output_dir(
+                clip_input_to_pass, parent=parent, display_name=clip.stem).as_posix()
             print(f"Output directory: {Colors.GREEN}{output_dir}{Colors.RESET}")
 
             # Assemble command
@@ -858,12 +858,11 @@ def main():
             is_first_run = False
 
             # Determine output directory for the current clip
-            if custom_output_parent:
-                input_path_obj = Path(input_path)
-                output_dir = str(Path(custom_output_parent) / f"out_{input_path_obj.stem}").replace("\\", "/")
-            else:
-                input_path_obj = Path(input_path)
-                output_dir = str(input_path_obj.parent / f"out_{input_path_obj.stem}").replace("\\", "/")
+            input_path_obj = Path(input_path)
+            input_path_to_pass = str(seq_input_dir) if is_image_seq_dir else input_path
+            parent = Path(custom_output_parent) if custom_output_parent else input_path_obj.parent
+            output_dir = default_output_dir(
+                input_path_to_pass, parent=parent, display_name=input_path_obj.stem).as_posix()
                 
             print(f"Output directory: {Colors.GREEN}{output_dir}{Colors.RESET}")
 

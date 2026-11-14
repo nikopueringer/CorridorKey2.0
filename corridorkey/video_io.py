@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import glob
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -17,6 +19,7 @@ import numpy as np
 import torch
 
 from . import color_utils as cu
+from .camera_video import CameraVideoReader, read_frame_dir_codes
 
 
 @dataclass
@@ -28,6 +31,66 @@ class WriterConfig:
     pix_fmt: str = "yuv444p10le"
     bitrate: str | None = None
     threads: int = 2
+
+
+class _QueuedWriter:
+    """Queue helpers shared by asynchronous video and EXR writers."""
+
+    def _init_queue(self, maxsize: int):
+        if int(maxsize) < 1:
+            raise ValueError(f"writer queue maxsize must be >= 1, got {maxsize}")
+        self.q = queue.Queue(maxsize=int(maxsize))
+        self.err: Exception | None = None
+        self._submit_lock = threading.Lock()
+        self._release_lock = threading.Lock()
+        self._closing = False
+        self._released = False
+
+    def _record_error(self, exc: Exception):
+        if self.err is None:
+            self.err = exc
+
+    def _enqueue(self, item, *, internal: bool = False):
+        while True:
+            if self.err is not None:
+                raise self.err
+            if self._closing and not internal:
+                raise RuntimeError("writer is closing")
+            if not self.thread.is_alive():
+                if self.err is not None:
+                    raise self.err
+                raise RuntimeError("writer worker stopped before accepting queued data")
+            try:
+                self.q.put(item, timeout=0.05)
+                # A worker may fail and free a queue slot between our poll and
+                # this put. Do not report success for an item accepted only
+                # because a failed worker began draining its pending queue.
+                if self.err is not None:
+                    self._drain_pending()
+                    raise self.err
+                if self._closing and not internal:
+                    self._drain_pending()
+                    raise RuntimeError("writer is closing")
+                if not internal and not self.thread.is_alive():
+                    if self.err is not None:
+                        self._drain_pending()
+                        raise self.err
+                    self._drain_pending()
+                    raise RuntimeError("writer worker stopped while accepting queued data")
+                return
+            except queue.Full:
+                # Recheck worker state on every timeout. In particular, never
+                # strand a producer behind a full queue after worker failure.
+                continue
+
+    def _drain_pending(self):
+        while True:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self.q.task_done()
 
 
 def require_ffmpeg(ffmpeg_bin: str) -> None:
@@ -63,11 +126,25 @@ def raw_clip_name(path: str | os.PathLike) -> str:
     return name
 
 
+_FRAME_EXTS = (".exr", ".png", ".jpg", ".jpeg")
+
+
+def _natural_key(path: str):
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
 def frame_paths(frame_dir: str | os.PathLike) -> list[str]:
-    paths: list[str] = []
-    for ext in ("*.exr", "*.png", "*.jpg", "*.jpeg"):
-        paths.extend(glob.glob(os.path.join(str(frame_dir), ext)))
-    return sorted(paths)
+    """Image frames in ``frame_dir``, in natural (numeric-aware) order.
+
+    Extensions are matched case-insensitively (``.PNG``/``.EXR`` too) and
+    unpadded numbering (``f_2`` before ``f_10``) keeps temporal order.
+    """
+    frame_dir = str(frame_dir)
+    paths = [os.path.join(frame_dir, n) for n in os.listdir(frame_dir)
+             if n.lower().endswith(_FRAME_EXTS)
+             and os.path.isfile(os.path.join(frame_dir, n))]
+    return sorted(paths, key=_natural_key)
 
 
 def ceil_to_multiple(x: int, q: int) -> int:
@@ -185,7 +262,8 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
                      native_resolution: bool, start_mode: str, seed: int,
                      model_scale: float, linear_brightness: float,
                      linear_contrast: float,
-                     linear_contrast_pivot: float) -> dict:
+                     linear_contrast_pivot: float,
+                     decoded_frame_count: int | None = None) -> dict:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -194,6 +272,13 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     h_native = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
+    if decoded_frame_count is not None:
+        if decoded_frame_count <= 0:
+            raise ValueError("decoded frame count must be positive")
+        if n_total != decoded_frame_count:
+            print(f"  Frame count corrected: container reports {n_total}, "
+                  f"decoder outputs {decoded_frame_count}")
+        n_total = int(decoded_frame_count)
 
     q = int(shape_quantum)
     if native_resolution:
@@ -223,6 +308,7 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
             raise ValueError(f"unknown start mode {start_mode!r}")
 
     meta = {
+        "total_frames": n_total if n_total > 0 else None,
         "native_fps": native_fps,
         "native_hw": native_hw,
         "output_hw": output_hw,
@@ -296,9 +382,66 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
     return meta
 
 
+@functools.lru_cache(maxsize=8)
+def _uint8_view_luts(gain: float, contrast: float, pivot: float):
+    """bfloat16 bit patterns of each preprocessed view for all 256 code values.
+
+    Without a resize every view is a pure per-pixel function of the 8-bit code
+    value, so the float sRGB decode and asinh encode only need to run 256 times
+    instead of once per pixel. The tables are built by the same functions as
+    the float path, so the resulting tensors are identical.
+    """
+    meta = {"linear_brightness": gain, "linear_contrast": contrast,
+            "linear_contrast_pivot": pivot}
+    # Repeat each code so it is evaluated by the same vectorized kernels as a
+    # full frame rather than by a scalar tail loop.
+    rep = 64
+    frame = np.repeat(np.arange(256, dtype=np.uint8), rep).astype(np.float32) / 255.0
+    linear_model = apply_linear_adjust(cu.srgb_to_linear(frame), meta)
+
+    def bits(x: np.ndarray) -> np.ndarray:
+        t = torch.from_numpy(np.ascontiguousarray(x[::rep]))
+        return t.to(dtype=torch.bfloat16).view(torch.int16).numpy()
+
+    review = bits(frame)
+    foundation = (bits(cu.linear_to_vfm_sdr(linear_model))
+                  if has_linear_adjust(meta) else review)
+    return bits(cu.linear_to_asinh(linear_model)), foundation, review
+
+
+def _lut_to_bf16(chw_u8: np.ndarray, lut_bits: np.ndarray) -> torch.Tensor:
+    out = cv2.LUT(chw_u8.reshape(-1, chw_u8.shape[-1]), lut_bits)
+    return torch.from_numpy(out.reshape(chw_u8.shape)).view(torch.bfloat16)
+
+
+def _preprocess_uint8_bgr_views(frame_bgr: np.ndarray, meta: dict, *,
+                                need_model: bool):
+    """Table-lookup equivalent of the float path for unscaled 8-bit frames."""
+    h_out, w_out = meta["shape_hw"]
+    # Reflect padding copies pixels, so it commutes with the per-pixel lookup.
+    padded, _ = center_pad_to_shape(frame_bgr, h_out, w_out)
+    chw = np.ascontiguousarray(padded.transpose(2, 0, 1)[::-1])
+    model_lut, foundation_lut, review_lut = _uint8_view_luts(
+        float(meta.get("linear_brightness", 1.0)),
+        float(meta.get("linear_contrast", 1.0)),
+        float(meta.get("linear_contrast_pivot", 0.18)))
+    review = _lut_to_bf16(chw, review_lut)
+    foundation = (review if foundation_lut is review_lut
+                  else _lut_to_bf16(chw, foundation_lut))
+    model = _lut_to_bf16(chw, model_lut) if need_model else None
+    return model, foundation, review
+
+
+def _is_unscaled_uint8_bgr(frame, meta: dict) -> bool:
+    return (frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3
+            and frame.shape[:2] == tuple(meta["model_native_hw"]))
+
+
 def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    if _is_unscaled_uint8_bgr(frame_bgr, meta):
+        return _preprocess_uint8_bgr_views(frame_bgr, meta, need_model=need_model)
     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     frame = resize_hwc_lanczos(frame, (h_model, w_model))
     frame, _ = center_pad_to_shape(frame, h_out, w_out)
@@ -320,9 +463,43 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     return model_t, foundation, review
 
 
+def preprocess_camera_code_views(rgb_codes: np.ndarray, meta: dict, *,
+                                 need_model: bool):
+    """Decode camera RGB codes to working-linear before spatial resampling."""
+    from .camera_color import decode_to_working
+
+    linear = decode_to_working(rgb_codes, str(meta["input_color_space"]))
+    linear = apply_linear_adjust(linear, meta)
+    h_out, w_out = meta["shape_hw"]
+    h_model, w_model = meta["model_native_hw"]
+    linear = resize_hwc_lanczos(linear, (h_model, w_model))
+    linear, _ = center_pad_to_shape(linear, h_out, w_out)
+    review_np = np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
+    review = torch.from_numpy(review_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    foundation_np = cu.linear_to_vfm_sdr(linear)
+    foundation = torch.from_numpy(
+        foundation_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    if not need_model:
+        return None, foundation, review
+    model_np = cu.linear_to_asinh(linear)
+    model = torch.from_numpy(model_np.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    return model, foundation, review
+
+
 def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
+    if (not meta.get("exr_linear", False)
+            and not str(path).lower().endswith(".exr")
+            and not has_linear_adjust(meta)):
+        # The original frame-directory float path does not apply these adjustments.
+        # Keep adjusted metadata on that path to preserve its existing behavior.
+        frame_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise FileNotFoundError(path)
+        if _is_unscaled_uint8_bgr(frame_bgr, meta):
+            return _preprocess_uint8_bgr_views(
+                frame_bgr, meta, need_model=need_model)
     display, linear = _read_frame_dir_views(
         path, exr_linear=bool(meta.get("exr_linear", False)))
     display = resize_hwc_lanczos(display, (h_model, w_model))
@@ -342,28 +519,45 @@ class SequentialVideoWindowReader:
     def __init__(self, video_path: str, meta: dict):
         self.video_path = video_path
         self.meta = meta
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
         self.start_frame = int(meta["start_frame"])
         self.n_frames = int(meta["num_frames"])
-        if self.start_frame:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.camera_reader = None
+        if meta.get("input_color_space", "legacy") != "legacy":
+            h, w = meta["native_hw"]
+            self.camera_reader = CameraVideoReader(
+                video_path, width=w, height=h,
+                input_range=meta.get("input_range", "auto"),
+                ffmpeg_bin=meta.get("ffmpeg_bin", "ffmpeg"),
+                total_frames=meta.get("total_frames"))
+            self.cap = None
+        else:
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Could not open video: {video_path}")
+            if self.start_frame:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
         self.next_t = 0
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def close(self):
-        self.cap.release()
+        if self.camera_reader is not None:
+            self.camera_reader.close()
+        if self.cap is not None:
+            self.cap.release()
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            ret, frame = self.cap.read()
-            if not ret:
-                raise RuntimeError(
-                    f"{self.video_path}: failed decoding frame "
-                    f"{self.start_frame + self.next_t}")
-            self.cache[self.next_t] = preprocess_video_frame_views(
-                frame, self.meta, need_model=True)
+            if self.camera_reader is not None:
+                codes = self.camera_reader.read_code_frame(self.start_frame + self.next_t)
+                views = preprocess_camera_code_views(codes, self.meta, need_model=True)
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    raise RuntimeError(
+                        f"{self.video_path}: failed decoding frame "
+                        f"{self.start_frame + self.next_t}")
+                views = preprocess_video_frame_views(frame, self.meta, need_model=True)
+            self.cache[self.next_t] = views
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
@@ -389,8 +583,13 @@ class SequentialFrameDirWindowReader:
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            self.cache[self.next_t] = preprocess_frame_dir_path(
-                self.paths[self.next_t], self.meta, need_model=True)
+            if self.meta.get("input_color_space", "legacy") != "legacy":
+                codes = read_frame_dir_codes(self.paths[self.next_t])
+                views = preprocess_camera_code_views(codes, self.meta, need_model=True)
+            else:
+                views = preprocess_frame_dir_path(
+                    self.paths[self.next_t], self.meta, need_model=True)
+            self.cache[self.next_t] = views
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
@@ -404,7 +603,38 @@ class SequentialFrameDirWindowReader:
 
 
 def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
-                            need_model: bool):
+                            need_model: bool, view: str = "foundation"):
+    if view not in ("foundation", "review"):
+        raise ValueError(f"unsupported frame view {view!r}")
+    if meta.get("input_color_space", "legacy") != "legacy":
+        h, w = meta["native_hw"]
+        reader = CameraVideoReader(video_path, width=w, height=h,
+                                   input_range=meta.get("input_range", "auto"),
+                                   ffmpeg_bin=meta.get("ffmpeg_bin", "ffmpeg"),
+                                   total_frames=meta.get("total_frames"))
+        t = 0
+        try:
+            while t < int(meta["num_frames"]):
+                model_list = [] if need_model else None
+                foundation_list = []
+                t0 = t
+                while t < int(meta["num_frames"]) and len(foundation_list) < chunk_size:
+                    codes = reader.read_code_frame(int(meta["start_frame"]) + t)
+                    model, foundation, review = preprocess_camera_code_views(
+                        codes, meta, need_model=need_model)
+                    if need_model:
+                        model_list.append(model)
+                    foundation_list.append(review if view == "review" else foundation)
+                    t += 1
+                if not foundation_list:
+                    break
+                yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
+        finally:
+            reader.close()
+        if t < int(meta["num_frames"]):
+            raise RuntimeError(
+                f"{video_path}: decoded only {t}/{meta['num_frames']} requested frames")
+        return
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -420,11 +650,11 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
                 ret, frame = cap.read()
                 if not ret:
                     break
-                model, foundation, _review = preprocess_video_frame_views(
+                model, foundation, review = preprocess_video_frame_views(
                     frame, meta, need_model=need_model)
                 if need_model:
                     model_list.append(model)
-                foundation_list.append(foundation)
+                foundation_list.append(review if view == "review" else foundation)
                 t += 1
             if not foundation_list:
                 break
@@ -437,7 +667,9 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
 
 
 def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
-                          need_model: bool):
+                          need_model: bool, view: str = "foundation"):
+    if view not in ("foundation", "review"):
+        raise ValueError(f"unsupported frame view {view!r}")
     paths = meta["frame_paths"]
     t = 0
     while t < len(paths):
@@ -445,11 +677,16 @@ def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
         model_list = [] if need_model else None
         foundation_list = []
         while t < len(paths) and len(foundation_list) < chunk_size:
-            model, foundation, _review = preprocess_frame_dir_path(
-                paths[t], meta, need_model=need_model)
+            if meta.get("input_color_space", "legacy") != "legacy":
+                codes = read_frame_dir_codes(paths[t])
+                model, foundation, review = preprocess_camera_code_views(
+                    codes, meta, need_model=need_model)
+            else:
+                model, foundation, review = preprocess_frame_dir_path(
+                    paths[t], meta, need_model=need_model)
             if need_model:
                 model_list.append(model)
-            foundation_list.append(foundation)
+            foundation_list.append(review if view == "review" else foundation)
             t += 1
         yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
 
@@ -546,10 +783,16 @@ class SequentialHintFrameDirWindowReader:
         self.hint_dir_path = hint_dir_path
         self.meta = meta
         self.paths = frame_paths(hint_dir_path)
-        if len(self.paths) < int(meta["num_frames"]):
+        self.start_frame = int(meta.get("start_frame", 0))
+        self.n_frames = int(meta["num_frames"])
+        if self.start_frame < 0 or self.n_frames < 0:
+            raise ValueError("hint start_frame and num_frames must be non-negative")
+        required = self.start_frame + self.n_frames
+        if len(self.paths) < required:
             raise RuntimeError(
-                f"{hint_dir_path}: only {len(self.paths)} hint frames for "
-                f"{meta['num_frames']} source frames")
+                f"{hint_dir_path}: only {len(self.paths)} hint frames; "
+                f"need {required} for start={self.start_frame}, "
+                f"num_frames={self.n_frames}")
         self.next_t = 0
         self.cache: dict[int, torch.Tensor] = {}
 
@@ -557,12 +800,21 @@ class SequentialHintFrameDirWindowReader:
         pass
 
     def _read_until(self, t_end: int):
+        if t_end < 0 or t_end > self.n_frames:
+            raise ValueError(
+                f"hint window end {t_end} is outside [0, {self.n_frames}]")
         while self.next_t < t_end:
-            frame = cv2.imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
+            path = self.paths[self.start_frame + self.next_t]
+            frame = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                raise RuntimeError(f"{path}: failed decoding hint frame")
             self.cache[self.next_t] = preprocess_hint_frame(frame, self.meta)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
+        if t0 < 0 or t1 < t0 or t1 > self.n_frames:
+            raise ValueError(
+                f"hint window [{t0}, {t1}) is outside [0, {self.n_frames}]")
         self._read_until(t1)
         hint = torch.stack([self.cache[t] for t in range(t0, t1)])
         for old_t in [k for k in self.cache if k < t0]:
@@ -580,12 +832,24 @@ def make_hint_reader(path: str | None, meta: dict):
 
 
 def window_starts(T_all: int, chunk: int, stride: int) -> list[int]:
+    T_all, chunk, stride = int(T_all), int(chunk), int(stride)
+    if T_all < 0:
+        raise ValueError(f"frame count must be non-negative, got {T_all}")
+    validate_hann_window(chunk, stride)
     if T_all <= chunk:
         return [0]
     starts = list(range(0, T_all - chunk + 1, stride))
     if starts[-1] != T_all - chunk:
         starts.append(T_all - chunk)
     return starts
+
+
+def validate_hann_window(chunk: int, stride: int) -> None:
+    """Reject invalid temporal window settings before inference starts."""
+    if chunk < 1:
+        raise ValueError(f"chunk must be >= 1, got {chunk}")
+    if stride < 1 or stride > chunk:
+        raise ValueError(f"stride must satisfy 1 <= stride <= chunk, got {stride} for chunk {chunk}")
 
 
 def taper_weights(Tc: int, overlap: int, *, is_first: bool, is_last: bool,
@@ -604,10 +868,10 @@ def taper_weights(Tc: int, overlap: int, *, is_first: bool, is_last: bool,
     return w
 
 
-class ThreadedVideoWriter:
+class ThreadedVideoWriter(_QueuedWriter):
     def __init__(self, path: str, fps: float, size: tuple[int, int],
                  cfg: WriterConfig, *, maxsize: int = 2, channels: int = 3,
-                 color_trc: str | None = None):
+                 color_trc: str | None = None, tag_color: bool = True):
         self.path = path
         self.fps = float(fps)
         self.size = size
@@ -615,9 +879,10 @@ class ThreadedVideoWriter:
         self.maxsize = maxsize
         self.channels = channels
         self.color_trc = color_trc
+        self.tag_color = bool(tag_color)
         self.proc = None
-        self.q = queue.Queue(maxsize=maxsize)
-        self.err = None
+        self.written_frames = 0
+        self._init_queue(maxsize)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self._start()
 
@@ -651,13 +916,20 @@ class ThreadedVideoWriter:
             else:
                 cmd.extend(["-crf", str(int(self.cfg.crf))])
                 
-        trc = self.color_trc if self.color_trc is not None else "iec61966-2-1"
-        cmd.extend([
-            "-threads", str(max(1, self.cfg.threads)),
-            "-colorspace", "bt709", "-color_primaries", "bt709",
-            "-color_trc", trc, "-movflags", "+write_colr",
-            self.path
-        ])
+        cmd.extend(["-threads", str(max(1, self.cfg.threads))])
+        # YUV matrix metadata is independent from the RGB primaries/transfer.
+        # Camera-log source encodes keep BT.709 Y'CbCr matrix conversion but
+        # omit primaries/TRC tags rather than falsely labelling camera RGB.
+        cmd.extend(["-colorspace", "bt709"])
+        if self.tag_color:
+            trc = self.color_trc if self.color_trc is not None else "iec61966-2-1"
+            # Set frame-level properties as well as stream/container tags.
+            # ProRes MOV writers otherwise emit the transfer tag in `colr`
+            # while leaving the encoded frame properties unspecified.
+            cmd.extend(["-vf", f"setparams=color_primaries=bt709:color_trc={trc}"])
+            cmd.extend(["-color_primaries", "bt709", "-color_trc", trc,
+                        "-movflags", "+write_colr"])
+        cmd.append(self.path)
         
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         self.thread.start()
@@ -666,41 +938,93 @@ class ThreadedVideoWriter:
         try:
             while True:
                 item = self.q.get()
-                if item is None:
+                try:
+                    if item is None:
+                        return
+                    self.proc.stdin.write(item.tobytes())
+                    self.written_frames += item.shape[0]
+                finally:
                     self.q.task_done()
-                    return
-                self.proc.stdin.write(item.tobytes())
-                self.q.task_done()
         except Exception as exc:
-            self.err = exc
+            self._record_error(exc)
+        finally:
+            # A failed worker must release every queue slot so blocked callers
+            # can wake, observe the failure, and return.
+            self._drain_pending()
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
     def write_many(self, frames: np.ndarray):
-        if self.err is not None:
-            raise self.err
         arr = np.ascontiguousarray(frames)
         if arr.ndim != 4 or arr.shape[-1] != self.channels:
             raise ValueError(
                 f"expected batched frames as NHWC uint16 with {self.channels} channels, got {arr.shape}")
         if arr.dtype != np.uint16:
             raise ValueError(f"expected uint16 frames, got {arr.dtype}")
-        self.q.put(arr)
+        with self._submit_lock:
+            self._enqueue(arr)
 
-    def release(self):
-        self.q.put(None)
-        self.thread.join()
-        if self.proc is not None and self.proc.stdin is not None:
-            self.proc.stdin.close()
-        rc = self.proc.wait() if self.proc is not None else 0
-        if rc != 0 and self.err is None:
-            self.err = RuntimeError(f"ffmpeg writer failed with exit code {rc}: {self.path}")
-        if self.err is not None:
-            raise self.err
+    def release(self, abort: bool = False):
+        with self._release_lock:
+            if self._released:
+                if self.err is not None:
+                    raise self.err
+                return
+            if abort:
+                # Fence blocked submitters before waiting for their submit lock;
+                # their bounded put loop will observe _closing and return.
+                self._closing = True
+                with self._submit_lock:
+                    pass
+                if self.proc is not None and self.proc.poll() is None:
+                    try:
+                        self.proc.terminate()
+                    except OSError as exc:
+                        if self.proc.poll() is None:
+                            self._record_error(exc)
+                    if self.proc.poll() is None:
+                        try:
+                            self.proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.proc.kill()
+                            self.proc.wait()
+                self._drain_pending()
+            else:
+                with self._submit_lock:
+                    self._closing = True
+            if self.thread.is_alive():
+                try:
+                    self._enqueue(None, internal=True)
+                except Exception as exc:
+                    self._record_error(exc)
+            # Successful close deliberately has no wall-clock cutoff: accepted
+            # writes must drain before the encoder receives EOF.
+            self.thread.join()
+            if self.proc is not None:
+                if self.proc.stdin is not None and not self.proc.stdin.closed:
+                    try:
+                        self.proc.stdin.close()
+                    except Exception as exc:
+                        self._record_error(exc)
+                if self.err is not None and self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait()
+                else:
+                    rc = self.proc.wait()
+                    if rc != 0:
+                        self._record_error(RuntimeError(
+                            f"ffmpeg writer failed with exit code {rc}: {self.path}"))
+            self._released = True
+            if self.err is not None:
+                raise self.err
 
 
-class ExrSequenceWriter:
+class ExrSequenceWriter(_QueuedWriter):
     """Writes float frames as an OpenEXR image sequence (scene-referred, unclamped).
 
     Accepts NHWC float32 batches with `channels` channels in BGR(A) order,
@@ -728,8 +1052,8 @@ class ExrSequenceWriter:
         ]
         os.makedirs(self.dir_path, exist_ok=True)
         self.frame_idx = 0
-        self.q = queue.Queue(maxsize=maxsize)
-        self.err = None
+        self.written_frames = 0
+        self._init_queue(maxsize)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -737,28 +1061,30 @@ class ExrSequenceWriter:
         try:
             while True:
                 item = self.q.get()
-                if item is None:
+                try:
+                    if item is None:
+                        return
+                    idx0, arr = item
+                    if self.clamp_half:
+                        # float16 overflows to inf above 65504; keep half EXRs finite
+                        arr = np.clip(arr, -65504.0, 65504.0)
+                    for j in range(arr.shape[0]):
+                        out_path = os.path.join(
+                            self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
+                        frame = np.ascontiguousarray(arr[j])
+                        if frame.shape[-1] == 1:
+                            frame = frame[..., 0]
+                        if not cv2.imwrite(out_path, frame, self.imwrite_params):
+                            raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+                        self.written_frames += 1
+                finally:
                     self.q.task_done()
-                    return
-                idx0, arr = item
-                if self.clamp_half:
-                    # float16 overflows to inf above 65504; keep half EXRs finite
-                    arr = np.clip(arr, -65504.0, 65504.0)
-                for j in range(arr.shape[0]):
-                    out_path = os.path.join(
-                        self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
-                    frame = np.ascontiguousarray(arr[j])
-                    if frame.shape[-1] == 1:
-                        frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
-                self.q.task_done()
         except Exception as exc:
-            self.err = exc
+            self._record_error(exc)
+        finally:
+            self._drain_pending()
 
     def write_many(self, frames: np.ndarray):
-        if self.err is not None:
-            raise self.err
         arr = np.ascontiguousarray(frames)
         if arr.ndim != 4 or arr.shape[-1] != self.channels:
             raise ValueError(
@@ -766,17 +1092,39 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
-        self.q.put((self.frame_idx, arr))
-        self.frame_idx += arr.shape[0]
+        with self._submit_lock:
+            idx0 = self.frame_idx
+            self._enqueue((idx0, arr))
+            self.frame_idx += arr.shape[0]
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
-    def release(self):
-        self.q.put(None)
-        self.thread.join()
-        if self.err is not None:
-            raise self.err
+    def release(self, abort: bool = False):
+        with self._release_lock:
+            if self._released:
+                if self.err is not None:
+                    raise self.err
+                return
+            if abort:
+                self._closing = True
+                with self._submit_lock:
+                    pass
+                # The in-progress cv2.imwrite call cannot safely be cancelled;
+                # discard only frames that have not begun writing.
+                self._drain_pending()
+            else:
+                with self._submit_lock:
+                    self._closing = True
+            if self.thread.is_alive():
+                try:
+                    self._enqueue(None, internal=True)
+                except Exception as exc:
+                    self._record_error(exc)
+            self.thread.join()
+            self._released = True
+            if self.err is not None:
+                raise self.err
 
 
 def color_chw_to_bgr(x: np.ndarray) -> np.ndarray:

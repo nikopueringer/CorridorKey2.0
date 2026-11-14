@@ -5,15 +5,20 @@ import os
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from . import color_utils as cu
 from .model import CorridorKeyV3
+from .device import area_resize, empty_cache, memory_budget_gb, model_device, synchronize
+from .mps_attention import available as native_attention_available
+from .mps_linear import preserve_mps_linear_bias
+from .outputs import OutputSnapshot, OutputTransaction, contained_path, merge_manifest, validate_destination
 from .video_io import (
     ExrSequenceWriter,
     ThreadedVideoWriter,
@@ -33,6 +38,7 @@ from .video_io import (
     safe_remove,
     taper_weights,
     window_starts,
+    validate_hann_window,
     SequentialFrameDirWindowReader,
     SequentialVideoWindowReader,
 )
@@ -69,9 +75,10 @@ class RuntimePaths:
     @classmethod
     def from_package(cls, package_root: str | os.PathLike,
                      weights: str | os.PathLike | None = None):
-        root = Path(package_root).resolve()
+        # Packaged apps keep model downloads outside the application bundle.
+        root = Path(os.environ.get("CORRIDORKEY_ASSET_ROOT") or package_root).expanduser().resolve()
         return cls(
-            package_root=root,
+            package_root=Path(package_root).resolve(),
             weights=cls._resolve_user_or_package_path(
                 root, weights, cls._prefer_safetensors(root, "weights/corridorkey_v2")),
             foundation_stats=(
@@ -127,6 +134,14 @@ class InferenceConfig:
     despill_strength: float = 0.5
     output_format: str = "video"
     exr_dtype: str = "half"
+    input_color_space: str = "legacy"
+    color_output: str = "processed_working"
+    input_range: str = "auto"
+
+    def validate(self) -> None:
+        validate_hann_window(self.hann_chunk, self.hann_stride)
+        if not self.outputs or not self.outputs <= {"alpha", "fg", "checker", "cutout"}:
+            raise ValueError("Select at least one supported output")
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -187,15 +202,39 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
     return 1, 1, True, estimate
 
 
-def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
-    free_bytes, _ = torch.cuda.mem_get_info()
-    # Memory this process already holds (the loaded model) is part of the budget.
-    budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
+def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int, device="cuda") -> None:
+    budget_gb = memory_budget_gb(device)
     chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
+    if torch.device(device).type == "mps" and low_vram:
+        # CUDA-sized batches retain much larger attention intermediates on MPS.
+        # This applies only to automatic memory selection. Explicit Hann or
+        # low-VRAM mode retains the user's batch settings.
+        for name, limit in (
+            ("low_vram_full_attn_query_chunk_tokens", 512),
+            ("low_vram_swin_window_batch", 4),
+            ("low_vram_mlp_chunk_tokens", 16384),
+        ):
+            current = getattr(cfg, name)
+            if current > 0:
+                setattr(cfg, name, min(current, limit))
+        if budget_gb < 6:
+            # Small unified-memory Macs need smaller *spatial* batches too.
+            # These controls preserve attention token sets and model precision.
+            native_attention = native_attention_available()
+            for name, limit in (
+                ("low_vram_foundation_chunk", 1),
+                ("low_vram_full_attn_query_chunk_tokens", 512 if native_attention else 128),
+                ("low_vram_swin_window_batch", 4 if native_attention else 1),
+                ("low_vram_mlp_chunk_tokens", 16384 if native_attention else 4096),
+            ):
+                current = getattr(cfg, name)
+                if current > 0:
+                    setattr(cfg, name, min(current, limit))
+    estimate_label = "CUDA reference peak" if torch.device(device).type == "mps" else "estimated peak"
     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
-          f"(estimated peak {estimate:.1f} GB)")
+          f"({estimate_label} {estimate:.1f} GB)")
     if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
               "resolution. Inference may run out of memory.")
@@ -235,6 +274,12 @@ def load_runtime_checkpoint(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
 
 
+_BF16_WEIGHT_MODULES = (
+    nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d,
+    nn.ConvTranspose1d, nn.ConvTranspose2d, nn.ConvTranspose3d,
+)
+
+
 def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
     paths.validate()
     prepare_runtime_environment(paths)
@@ -252,6 +297,7 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
 
     print(f"Loading CorridorKey v2 runtime weights: {paths.weights}")
     model = CorridorKeyV3(**cfg)
+    model._runtime_device = torch.device(device)
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
     train_missing = [k for k in missing if not k.startswith("foundations.")]
     train_unexpected = [k for k in unexpected if not k.startswith("foundations.")]
@@ -261,19 +307,33 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
             f"missing={train_missing[:8]} unexpected={train_unexpected[:8]}")
     print(f"  loaded weights; omitted frozen foundation tensors={len(missing)}")
     model.eval()
+    model.requires_grad_(False)
+    if torch.device(device).type == "mps":
+        count = preserve_mps_linear_bias(model)
+        print(f"  Metal Linear bias compatibility enabled for {count} layers")
+    # PR #9's storage optimization was validated on CUDA. Preserve PR #15's
+    # original storage policy on Metal until same-device parity is established.
+    if torch.device(device).type == "cuda":
+        for module in model.modules():
+            if isinstance(module, _BF16_WEIGHT_MODULES):
+                for p in module.parameters(recurse=False):
+                    p.data = p.data.to(torch.bfloat16)
     del ckpt
     return model
 
 
 def configure_low_vram_inference(model, cfg: InferenceConfig):
     model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
+    spatial_batches = model_device(model).type == "mps"
+    if spatial_batches and native_attention_available():
+        print("  Native MPSGraph attention enabled for chunked full-spatial layers", flush=True)
     for module in model.modules():
         name = module.__class__.__name__
         if name in ("SwiGLU", "FusionLinSwiglu"):
             module.inference_chunk_tokens = max(0, int(cfg.low_vram_mlp_chunk_tokens))
-        if name == "SwinAttention3D":
+        if name == "SwinAttention3D" or (spatial_batches and name == "SwinAttention2D"):
             module.inference_window_batch = max(0, int(cfg.low_vram_swin_window_batch))
-        if name == "CSwinAttention3D":
+        if name == "CSwinAttention3D" or (spatial_batches and name == "CSwinAttention2D"):
             module.inference_strip_batch = max(0, int(cfg.low_vram_swin_window_batch))
         if name in ("FullSpatialAttention2D", "FullAttention3D"):
             module.inference_query_chunk_tokens = max(
@@ -283,9 +343,9 @@ def configure_low_vram_inference(model, cfg: InferenceConfig):
 def _build_foundation_inputs(rgb_bt: torch.Tensor):
     B, T, _, H, W = rgb_bt.shape
     flat = rgb_bt.reshape(B * T, 3, H, W)
-    rgb_radio = F.interpolate(flat, size=(H // 4, W // 4), mode="area")
+    rgb_radio = area_resize(flat, size=(H // 4, W // 4))
     H_moge, W_moge = (H * 7) // 32, (W * 7) // 32
-    rgb_moge = F.interpolate(flat, size=(H_moge, W_moge), mode="area")
+    rgb_moge = area_resize(flat, size=(H_moge, W_moge))
     return (
         rgb_radio.reshape(B, T, 3, H // 4, W // 4),
         rgb_moge.reshape(B, T, 3, H_moge, W_moge),
@@ -329,19 +389,21 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
             future = pool.submit(_next_or_none, chunks)
             t0, _model, display = item
             Tc = display.shape[0]
-            rgb = display.unsqueeze(0).to(device, non_blocking=True).float()
+            # Keep Metal uploads synchronous. Asynchronous transfers produced
+            # non-finite output pixels in end-to-end inference tests.
+            rgb = display.unsqueeze(0).to(device, non_blocking=device.type == "cuda").float()
             rgb_rvm = F.interpolate(
                 rgb.reshape(Tc, 3, H, W), size=(H_e, W_e),
                 mode="bilinear", align_corners=False,
             ).reshape(1, Tc, 3, H_e, W_e).clamp(0.0, 1.0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 feats, state = model.foundations.rvm(rgb_rvm, state=state)
             feats_cpu = (feats.float().cpu() - mean) / std
             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
             del rgb, rgb_rvm, feats, feats_cpu, display
     out.flush()
     del out
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
 
 @torch.no_grad()
@@ -381,9 +443,9 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             future = pool.submit(_next_or_none, chunks)
             t0, _model, display = item
             Tc = display.shape[0]
-            rgb = display.unsqueeze(0).to(device, non_blocking=True)
+            rgb = display.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
             rgb_radio, rgb_moge = _build_foundation_inputs(rgb)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 ff = model.foundations(
                     rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                     rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -397,27 +459,45 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
     if cradio_out is not None:
         cradio_out.flush()
         del cradio_out
-    torch.cuda.empty_cache()
+    empty_cache(device)
     return paths
 
 
 def _phase1_setup(model, *, stage1_on_gpu: bool = True):
-    model.foundations.cuda()
+    device = model_device(model)
+    model.foundations.to(device)
     # Low-VRAM mode precomputes foundation features first, so stage 1 waits on CPU.
     if stage1_on_gpu:
-        model.stage1.cuda()
+        model.stage1.to(device)
     else:
         model.stage1.cpu()
     model.stage2.cpu()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
 
 def _phase2_setup(model):
+    device = model_device(model)
     model.foundations.cpu()
     model.stage1.cpu()
-    torch.cuda.empty_cache()
-    model.stage2.cuda()
-    torch.cuda.synchronize()
+    empty_cache(device)
+    model.stage2.to(device)
+    synchronize(device)
+
+
+def _close_readers(*readers) -> None:
+    """Attempt every close, retaining an inference error already in flight."""
+    primary = sys.exc_info()[1]
+    errors = []
+    for reader in readers:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception as exc:
+                errors.append(exc)
+    if errors and primary is None:
+        raise errors[0]
+    for exc in errors:
+        print(f"[WARNING] Reader cleanup reported: {exc}")
 
 
 @torch.no_grad()
@@ -505,14 +585,14 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                 for j, t_abs in enumerate(range(t0, t1)):
                     stage2_frame_cache[t_abs] = model_chunk[j]
 
-            rgb_c = model_chunk.unsqueeze(0).to(device, non_blocking=True)
-            hint_c = hint_cpu.to(device, non_blocking=True)
-            hint_quality_c = hint_quality_cpu.to(device, non_blocking=True)
+            rgb_c = model_chunk.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
+            hint_c = hint_cpu.to(device, non_blocking=device.type == "cuda")
+            hint_quality_c = hint_quality_cpu.to(device, non_blocking=device.type == "cuda")
             ff = rgb_radio = rgb_moge = None
             if foundation_paths is None:
-                rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=True)
+                rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
                 rgb_radio, rgb_moge = _build_foundation_inputs(rgb_found)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast(device.type, dtype=torch.bfloat16):
                     ff = model.foundations(
                         rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
                         rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
@@ -521,14 +601,14 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                 moge_feat = ff["moge"].reshape(1, Tc, -1, H // 64, W // 64)
             else:
                 moge_feat = torch.from_numpy(np.asarray(moge_map[t0:t1]).copy())
-                moge_feat = moge_feat.unsqueeze(0).to(device, non_blocking=True).float()
+                moge_feat = moge_feat.unsqueeze(0).to(device, non_blocking=device.type == "cuda").float()
                 cradio_feat = torch.from_numpy(np.asarray(cradio_map[t0:t1]).copy())
-                cradio_feat = cradio_feat.unsqueeze(0).to(device, non_blocking=True).float()
+                cradio_feat = cradio_feat.unsqueeze(0).to(device, non_blocking=device.type == "cuda").float()
             rvm_feat = None
             if rvm_map is not None:
                 rvm_feat = torch.from_numpy(np.asarray(rvm_map[t0:t1]).copy())
-                rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=True).float()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+                rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=device.type == "cuda").float()
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 s1 = model.stage1(
                     rgb_c, hint_c, moge_feat, cradio_feat=cradio_feat,
                     rvm_feat=rvm_feat, t_stride=1.0,
@@ -564,18 +644,19 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del rgb_c, hint_c, hint_quality_c, hint_cpu, hint_quality_cpu
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
+            if device.type == "mps":
+                # Release unused Metal buffers between overlapping windows.
+                empty_cache(device)
             print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
-        torch.cuda.synchronize()
+        synchronize(device)
         flush_before(T_all + 1)
     finally:
-        reader.close()
-        if hint_reader is not None:
-            hint_reader.close()
+        _close_readers(reader, hint_reader)
 
     if baton_fp16 is not None:
         baton_fp16.flush()
     del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
 
 def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -730,9 +811,78 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     return rendered
 
 
+def _replace_rendered_rgb_with_source(rendered: dict[str, np.ndarray],
+                                      source_frames: list[np.ndarray]):
+    """Preserve native decoded source RGB while keeping inferred alpha straight."""
+    source_bgr = np.stack([frame[..., ::-1] for frame in source_frames])
+    if "fg" in rendered:
+        rendered["fg"] = source_bgr.astype(np.float32, copy=False)
+    if "cutout" in rendered:
+        alpha = rendered["cutout"][..., 3:4]
+        rendered["cutout"] = np.concatenate((source_bgr, alpha), axis=-1).astype(
+            np.float32, copy=False)
+    return rendered
+
+
+def _write_color_manifest(path: str | os.PathLike, manifest: dict) -> None:
+    """Compatibility helper for atomically merging output descriptions."""
+    merge_manifest(Path(path), manifest)
+
+
+def _encode_rendered_camera_source(rendered: dict[str, np.ndarray],
+                                   profile_id: str, *, video: bool,
+                                   legacy_linear: bool = False):
+    """Convert unclamped working-linear render arrays to camera-log output.
+
+    EXR retains signed and over-range camera code values. Video output must
+    quantize to its representable range, but its camera primaries/TRC tags are
+    intentionally omitted by the writer.
+    """
+    if profile_id == "legacy" and not legacy_linear:
+        encode_rgb = lambda rgb: cu.linear_to_srgb(np.maximum(rgb, 0.0))
+    elif profile_id == "legacy":
+        encode_rgb = lambda rgb: rgb
+    else:
+        from .camera_color import encode_from_working
+        encode_rgb = lambda rgb: encode_from_working(rgb, profile_id)
+    if "fg" in rendered:
+        rendered["fg"] = np.ascontiguousarray(
+            encode_rgb(rendered["fg"][..., ::-1])[..., ::-1])
+    if "cutout" in rendered:
+        cutout = rendered["cutout"]
+        rgb = encode_rgb(cutout[..., 2::-1])
+        rendered["cutout"] = np.concatenate(
+            (rgb[..., ::-1], cutout[..., 3:4]), axis=-1)
+    if video:
+        for name in ("fg", "cutout"):
+            if name in rendered:
+                rendered[name] = (
+                    np.clip(rendered[name], 0.0, 1.0) * 65535.0
+                ).astype(np.uint16)
+        if "checker" in rendered:
+            checker_rgb = rendered["checker"][..., ::-1]
+            checker_srgb = np.clip(
+                cu.linear_to_srgb(np.maximum(checker_rgb, 0.0)), 0.0, 1.0)
+            rendered["checker"] = (
+                checker_srgb[..., ::-1] * 65535.0
+            ).astype(np.uint16)
+        if "alpha" in rendered:
+            alpha = np.clip(rendered["alpha"], 0.0, 1.0)
+            alpha_rgb = np.repeat(alpha, 3, axis=-1)
+            rendered["alpha"] = (alpha_rgb * 65535.0).astype(np.uint16)
+    return rendered
+
+
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
+    cfg.validate()
+    validate_destination(Path(output_dir), input_path)
+    # Half EXR cannot retain adjacent 16-bit source codes. Apply the same
+    # fidelity guarantee to CLI/API callers as to the desktop output control.
+    if cfg.color_output == "source_rgb" and cfg.exr_dtype != "float":
+        cfg = replace(cfg, exr_dtype="float")
+    device = model_device(model)
     input_path = str(input_path)
     output_dir = str(output_dir)
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -745,13 +895,17 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, fps=cfg.frame_dir_fps,
             exr_linear=cfg.frame_dir_linear, model_scale=cfg.model_scale)
-        if (not cfg.frame_dir_linear
+        if (cfg.input_color_space == "legacy" and not cfg.frame_dir_linear
                 and meta["frame_paths"]
                 and meta["frame_paths"][0].lower().endswith(".exr")):
             print("  [WARNING] EXR input frames are being treated as "
                   "display-coded and clipped to [0, 1]. For scene-linear HDR "
                   "EXR plates, pass --frame_dir_linear.")
     else:
+        decoded_frame_count = None
+        if cfg.input_color_space != "legacy" or cfg.color_output == "source_rgb":
+            from .media_probe import count_decoded_video_frames
+            decoded_frame_count = count_decoded_video_frames(input_path, writer_cfg.ffmpeg_bin)
         meta = probe_video_meta(
             input_path, num_frames=cfg.num_frames,
             shape_quantum=cfg.shape_quantum, native_resolution=True,
@@ -759,11 +913,36 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             model_scale=cfg.model_scale,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
-            linear_contrast_pivot=cfg.linear_contrast_pivot)
+            linear_contrast_pivot=cfg.linear_contrast_pivot,
+            decoded_frame_count=decoded_frame_count)
+    if cfg.input_range not in ("auto", "full", "legal"):
+        raise ValueError(f"unsupported input range {cfg.input_range!r}")
+    if cfg.color_output not in ("processed_working", "processed_source", "source_rgb"):
+        raise ValueError(f"unsupported color output {cfg.color_output!r}")
+    effective_color_output = cfg.color_output
+    if cfg.input_color_space != "legacy":
+        from .camera_color import PROFILES
+        if cfg.input_color_space not in PROFILES:
+            raise ValueError(f"unknown input color space {cfg.input_color_space!r}")
+    if effective_color_output == "source_rgb" and cfg.output_format != "exr":
+        raise ValueError("source_rgb requires --output_format exr to preserve source codes")
+    elif (effective_color_output == "processed_source" and is_dir
+          and cfg.frame_dir_linear and cfg.output_format != "exr"):
+        raise ValueError(
+            "processed_source for linear frame sequences requires --output_format exr")
+    meta["input_color_space"] = cfg.input_color_space
+    meta["color_output"] = effective_color_output
+    meta["input_range"] = cfg.input_range
+    meta["ffmpeg_bin"] = writer_cfg.ffmpeg_bin
+    if is_dir and cfg.input_color_space != "legacy":
+        meta["linear_brightness"] = float(cfg.linear_brightness)
+        meta["linear_contrast"] = float(cfg.linear_contrast)
+        meta["linear_contrast_pivot"] = float(cfg.linear_contrast_pivot)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
-        apply_auto_vram(cfg, (H, W), T_all)
+        apply_auto_vram(cfg, (H, W), T_all, device)
+    cfg.validate()
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
@@ -772,6 +951,11 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
+    source_reader = None
+    transaction = OutputTransaction(Path(output_dir), input_path, clip_name)
+    render_dir = transaction.stage
+    scratch = tempfile.TemporaryDirectory(prefix="inference-", dir=cfg.temp_dir)
+    scratch_dir = Path(scratch.name)
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -788,7 +972,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             if use_exr:
                 channels = 4 if name == "cutout" else (1 if name == "alpha" else 3)
                 writers[name] = ExrSequenceWriter(
-                    os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
+                    str(render_dir / f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
                     dtype=cfg.exr_dtype, frame_name=suffix[name])
             else:
@@ -796,11 +980,64 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 channels = 4 if name == "cutout" else 3
                 color_trc = "linear" if (name == "cutout" and cfg.cutout_linear) else "iec61966-2-1"
                 writers[name] = ThreadedVideoWriter(
-                    os.path.join(output_dir, f"{clip_name}_{suffix[name]}{ext}"),
-                    fps, (W_out, H_out), writer_cfg, channels=channels, color_trc=color_trc)
+                    str(render_dir / f"{clip_name}_{suffix[name]}{ext}"),
+                    fps, (W_out, H_out), writer_cfg, channels=channels,
+                    color_trc=color_trc,
+                    tag_color=not (
+                        cfg.input_color_space != "legacy"
+                        and effective_color_output == "processed_source"
+                        and name in ("fg", "cutout")))
 
+        if effective_color_output == "source_rgb" and not is_dir:
+            from .camera_video import CameraVideoReader
+            source_reader = CameraVideoReader(
+                input_path, width=int(meta["native_hw"][1]),
+                height=int(meta["native_hw"][0]),
+                input_range=cfg.input_range, ffmpeg_bin=writer_cfg.ffmpeg_bin)
+
+        output_profiles = {}
+        source_output_profile = (
+            cfg.input_color_space if cfg.input_color_space != "legacy" else
+            ("linear_rec709" if is_dir and cfg.frame_dir_linear else "srgb"))
+        for name in cfg.outputs:
+            if name == "alpha":
+                output_profiles[name] = {"profile": "matte", "data": "matte"}
+            elif name == "checker":
+                output_profiles[name] = {
+                    "profile": "linear_rec709" if use_exr else "srgb"}
+            elif effective_color_output in ("processed_source", "source_rgb"):
+                output_profiles[name] = {
+                    "profile": source_output_profile,
+                    **({"alpha": "straight"} if name == "cutout" else {}),
+                }
+            else:
+                output_profiles[name] = {
+                    "profile": ("linear_rec709" if use_exr else
+                                ("linear_rec709" if name == "cutout" and cfg.cutout_linear
+                                 else "srgb")),
+                    **({"alpha": "straight"} if name == "cutout" else {}),
+                }
+            extension = "_exr" if use_exr else (".mov" if name == "cutout" else ".mp4")
+            output_profiles[name]["path"] = f"{clip_name}_{suffix[name]}{extension}"
+            output_profiles[name]["native_fps"] = fps
+            output_profiles[name]["start_frame"] = int(meta.get("start_frame", 0))
+        color_manifest = {
+            "schema_version": 1,
+            "native_fps": fps,
+            "input_color_space": cfg.input_color_space,
+            "color_output": effective_color_output,
+            "input_range": cfg.input_range,
+            "outputs": output_profiles,
+        }
+        if (cfg.input_color_space != "legacy"
+                and effective_color_output == "processed_source"
+                and not use_exr):
+            color_manifest["video_note"] = (
+                "Camera-log RGB was clipped to [0,1] and encoded through a lossy "
+                "video codec. Camera primaries/TRC tags are omitted; Y'CbCr "
+                "matrix metadata is BT.709. Use EXR for unclipped float output.")
         # Write settings log file in the output folder
-        settings_path = os.path.join(output_dir, f"{clip_name}_settings.txt")
+        settings_path = render_dir / f"{clip_name}_settings.txt"
         try:
             with open(settings_path, "w") as sf:
                 sf.write(f"CorridorKey v2 Inference Settings Log\n")
@@ -821,6 +1058,14 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 sf.write(f"Despill Strength: {cfg.despill_strength}\n")
                 sf.write(f"Cutout Linear: {cfg.cutout_linear}\n")
                 sf.write(f"Frame Dir Linear: {cfg.frame_dir_linear}\n")
+                sf.write(f"Input Color Space: {cfg.input_color_space}\n")
+                sf.write(f"Color Output: {effective_color_output}\n")
+                sf.write(f"Input Range: {cfg.input_range}\n")
+                if (cfg.input_color_space != "legacy"
+                        and effective_color_output == "processed_source"
+                        and not use_exr):
+                    sf.write("Camera-log video output is clipped/quantized and lossy; "
+                             "camera primaries/TRC tags are omitted.\n")
                 sf.write(f"Hann Chunk: {cfg.hann_chunk}\n")
                 sf.write(f"Hann Stride: {cfg.hann_stride}\n")
                 sf.write(f"Low VRAM: {cfg.low_vram}\n")
@@ -841,9 +1086,9 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         _phase1_setup(model, stage1_on_gpu=not cfg.low_vram)
         if cfg.low_vram:
             configure_low_vram_inference(model, cfg)
-        rvm_path = cfg.temp_dir / f"{clip_name}_rvm_feat.f16"
-        baton_path = cfg.temp_dir / f"{clip_name}_baton.f16"
-        foundation_prefix = cfg.temp_dir / f"{clip_name}_foundation"
+        rvm_path = scratch_dir / f"{clip_name}_rvm_feat.f16"
+        baton_path = scratch_dir / f"{clip_name}_baton.f16"
+        foundation_prefix = scratch_dir / f"{clip_name}_foundation"
         for p in (
             rvm_path, baton_path, Path(str(foundation_prefix) + "_cradio.f32"),
             Path(str(foundation_prefix) + "_moge.f32"),
@@ -865,31 +1110,82 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader_kind=reader_kind)
             model.foundations.cpu()
             model.stage2.cpu()
-            model.stage1.cuda()
-            torch.cuda.empty_cache()
+            model.stage1.to(device)
+            empty_cache(device)
         else:
-            model.stage2.cuda()
+            model.stage2.to(device)
             model.stage2.eval()
-            torch.cuda.empty_cache()
+            empty_cache(device)
 
         stage2_batch = max(1, int(cfg.stage2_batch))
+
+        def original_source_codes(relative_index: int) -> np.ndarray:
+            absolute_index = int(meta["start_frame"]) + int(relative_index)
+            if is_dir:
+                from .camera_video import read_frame_dir_codes
+                return read_frame_dir_codes(meta["frame_paths"][absolute_index])
+            if source_reader is None:
+                raise RuntimeError("source RGB reader was not initialized")
+            return source_reader.read_code_frame(absolute_index)
+
+        def apply_color_output(rendered, sub):
+            if effective_color_output == "processed_working":
+                return rendered
+            if effective_color_output == "processed_source":
+                return _encode_rendered_camera_source(
+                    rendered, cfg.input_color_space, video=not use_exr,
+                    legacy_linear=is_dir and cfg.frame_dir_linear)
+
+            # source_rgb keeps the decoded source codes at native dimensions;
+            # only the inferred straight-alpha matte comes from the model.
+            if not (cfg.outputs & {"fg", "cutout", "checker"}):
+                return rendered
+            source_frames = [original_source_codes(item[0]) for item in sub]
+            source_alpha = (rendered["cutout"][..., 3:4]
+                            if "cutout" in rendered else rendered.get("alpha"))
+            rendered = _replace_rendered_rgb_with_source(rendered, source_frames)
+            if "checker" in rendered and source_alpha is not None:
+                bg_srgb = checker_t.permute(1, 2, 0).cpu().numpy()[None]
+                bg_linear = cu.srgb_to_linear(bg_srgb)
+                checker_frames = []
+                for source_codes, alpha in zip(source_frames, source_alpha):
+                    if cfg.input_color_space == "legacy":
+                        source_linear = (source_codes if is_dir and cfg.frame_dir_linear
+                                         else cu.srgb_to_linear(source_codes))
+                    else:
+                        from .camera_color import decode_to_working
+                        source_linear = decode_to_working(
+                            source_codes, cfg.input_color_space)
+                    comp = source_linear * alpha + bg_linear[0] * (1.0 - alpha)
+                    checker_frames.append(comp[..., ::-1])
+                rendered["checker"] = np.stack(checker_frames).astype(np.float32)
+            return rendered
 
         def write_prediction_batches(items):
             device = next(model.stage2.parameters()).device
             for offset in range(0, len(items), stage2_batch):
                 sub = items[offset:offset + stage2_batch]
                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
-                rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
+                rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
                 baton_np = np.stack([item[1] for item in sub], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
-                baton_t = baton_t.to(device, non_blocking=True).float()
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                baton_t = baton_t.to(device, non_blocking=device.type == "cuda").float()
+                with torch.inference_mode(), torch.autocast(device.type, dtype=torch.bfloat16):
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
-                render_fn = (_render_predictions_exr_torch if use_exr
+                render_fn = (_render_predictions_exr_torch
+                             if use_exr or effective_color_output == "processed_source"
                              else _render_predictions_torch)
-                rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
+                render_outputs = set(cfg.outputs)
+                if (effective_color_output == "source_rgb"
+                        and "checker" in cfg.outputs
+                        and not (cfg.outputs & {"alpha", "cutout"})):
+                    render_outputs.add("alpha")
+                rendered = render_fn(meta, render_outputs, checker_t, logits[0])
+                rendered = apply_color_output(rendered, sub)
+                for hidden in set(rendered) - set(cfg.outputs):
+                    del rendered[hidden]
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
                 del logits, baton_t, rgb_t, baton_np, rendered
@@ -908,6 +1204,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
 
         if cfg.low_vram:
             _phase2_setup(model)
+            print(f"    Stage2 rendering: frames={T_all}", flush=True)
             baton = np.memmap(
                 baton_path, dtype=np.float16, mode="r",
                 shape=(T_all, model.stage1.d_16, H // 16, W // 16))
@@ -921,17 +1218,54 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                         for t in range(t0, t1)
                     ]
                     write_prediction_batches(items)
+                    print(f"      output frames {t1}/{T_all}", flush=True)
                     del model_chunk, _display_chunk, _review_chunk, items
             finally:
-                reader.close()
-                del baton
+                try:
+                    _close_readers(reader)
+                finally:
+                    del baton
+        print("    Keying complete; closing outputs", flush=True)
     finally:
+        primary_error = sys.exc_info()[1]
+        cleanup_errors = []
+        if source_reader is not None:
+            try:
+                source_reader.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
         for writer in writers.values():
-            writer.release()
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
-        torch.cuda.empty_cache()
-    print(f"  wrote {len(writers)} output video(s) for {clip_name} "
+            try:
+                writer.release(abort=primary_error is not None or bool(cleanup_errors))
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        for finalizer in (scratch.cleanup, lambda: empty_cache(device)):
+            try:
+                finalizer()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if primary_error is not None or cleanup_errors:
+            try:
+                transaction.abort()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            if primary_error is None:
+                raise cleanup_errors[0]
+            for exc in cleanup_errors:
+                print(f"[WARNING] Cleanup reported: {exc}")
+    try:
+        for name, writer in writers.items():
+            if writer.written_frames != T_all:
+                raise RuntimeError(f"Incomplete {name} output: {writer.written_frames}/{T_all} frames")
+        published = transaction.commit(color_manifest, T_all)
+    except BaseException:
+        try:
+            transaction.abort()
+        except Exception as exc:
+            print(f"[WARNING] Staging cleanup reported: {exc}")
+        raise
+    print(f"  wrote {len(writers)} output(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
+    return OutputSnapshot(
+        {name: contained_path(transaction.root, entry["path"])
+         for name, entry in published["outputs"].items()}, published)

@@ -1,0 +1,124 @@
+name: Community desktop builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/linux-resolve-ofx]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: community-builds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-app:
+    name: Apple Silicon app and OFX (${{ matrix.os }})
+    # Exercise the minimum OS as well as the current one. Independent jobs
+    # also allow either standard arm64 pool to progress during capacity limits.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - name: Ensure external video tools for runtime tests
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+      - name: Fetch OpenFX headers
+        run: git clone --depth 1 --branch OFX_Release_1_4_TAG https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+      - name: Build and package the macOS OFX plugin
+        env:
+          OFX_INCLUDE_DIR: ${{ runner.temp }}/openfx/include
+        run: ./scripts/package_macos_ofx.sh
+      - name: Verify OpenFX bundle executable discovery name
+        run: |
+          ditto -x -k dist/CorridorKeyMacOS-OFX-arm64.zip "$RUNNER_TEMP/mac-ofx"
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          bundle = Path("${{ runner.temp }}/mac-ofx/CorridorKeyMacOS-OFX/CorridorKeyMacOS.ofx.bundle")
+          executable = bundle.name.removesuffix(".bundle")
+          plist = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+          assert plist["CFBundleExecutable"] == executable, plist["CFBundleExecutable"]
+          assert (bundle / "Contents/MacOS" / executable).is_file()
+          PY
+      - name: Build native app with bundled Python
+        run: ./scripts/build_macos.sh
+      - name: Verify the archived app after relocation
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/Relocation Test"
+          ditto -x -k dist/CorridorKey-macOS-arm64.zip "$RUNNER_TEMP/Relocation Test"
+          APP="$RUNNER_TEMP/Relocation Test/CorridorKey.app"
+          rm -rf dist/CorridorKey.app
+          codesign --verify --deep --strict "$APP"
+          QT_QPA_PLATFORM=offscreen "$APP/Contents/MacOS/CorridorKey" --bundle-self-test
+          if "$APP/Contents/MacOS/CorridorKey" --bundle-self-test-fail; then
+            echo "Launcher incorrectly hid a failing child process"
+            exit 1
+          else
+            test "$?" -eq 17
+          fi
+          PY="$APP/Contents/Resources/Python/bin/python3"
+          SRC="$APP/Contents/Resources/src"
+          "$PY" "$SRC/infer.py" --help
+          "$PY" "$SRC/scripts/diagnose_mps_attention.py" --output "$RUNNER_TEMP/mps-attention.json"
+          "$PY" -c 'import platform, torch; assert platform.machine() == "arm64"; assert torch.backends.mps.is_available(), "Metal is required for release verification"'
+          uv pip install --python "$PY" --target "$RUNNER_TEMP/test-tools" pytest
+          cd "$SRC"
+          PYTHONPATH="$RUNNER_TEMP/test-tools" QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q tests
+      - name: Upload Apple Silicon build
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKey-macOS-arm64-${{ matrix.os }}
+          path: dist/CorridorKey-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload Apple Silicon OFX plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKeyMacOS-ofx-arm64-${{ matrix.os }}
+          path: dist/CorridorKeyMacOS-OFX-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-launcher-log-${{ matrix.os }}
+          path: |
+            ~/Library/Logs/CorridorKey2.0/
+            ${{ runner.temp }}/mps-attention.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux-ofx:
+    name: Linux OFX bundle
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch OpenFX headers
+        run: git clone --depth 1 --branch OFX_Release_1_4_TAG https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+      - name: Build and exercise host boundary
+        run: |
+          cmake -S ofx -B build/ofx -DCMAKE_BUILD_TYPE=Release -DOFX_INCLUDE_DIR="$RUNNER_TEMP/openfx/include"
+          cmake --build build/ofx --parallel 2
+          ctest --test-dir build/ofx --output-on-failure
+          mkdir -p dist
+          tar -czf dist/CorridorKeyLinux-ofx-x86_64.tar.gz -C build/ofx CorridorKeyLinux.ofx.bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CorridorKeyLinux-ofx-x86_64
+          path: dist/CorridorKeyLinux-ofx-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30

@@ -19,7 +19,10 @@ from corridorkey.runtime import (
     load_model,
     run_inference,
 )
-from corridorkey.video_io import require_ffmpeg
+from corridorkey.video_io import require_ffmpeg, validate_hann_window
+from corridorkey.outputs import validate_destination
+from corridorkey.media_probe import validate_video, count_decoded_video_frames
+from corridorkey.device import configure_auto_memory, select_device
 
 
 def _parse_outputs(values):
@@ -82,6 +85,15 @@ def main():
     ap.add_argument("--model_scale", type=float, default=1.0,
                     help="Lanczos scale before model inference; 1.0 is native.")
     ap.add_argument("--frame_dir_fps", type=float, default=24.0)
+    ap.add_argument("--input_color_space", default="legacy",
+                    help="Camera log/gamut profile ID, or legacy (default).")
+    ap.add_argument("--color_output",
+                    choices=("processed_working", "processed_source", "source_rgb"),
+                    default="processed_working",
+                    help="Output RGB policy; source_rgb requires EXR and uses float precision.")
+    ap.add_argument("--input_range", choices=("auto", "full", "legal"),
+                    default="auto",
+                    help="Video signal range override passed to FFmpeg camera decode.")
     ap.add_argument("--frame_dir_linear", action="store_true",
                     help="Treat frame-directory inputs as scene-linear RGB.")
     ap.add_argument("--cutout_linear", action="store_true",
@@ -95,7 +107,8 @@ def main():
                     default="video",
                     help=("video: ffmpeg-encoded preview videos (display-"
                           "referred, clipped to [0,1]). exr: unclamped scene-"
-                          "linear OpenEXR image sequences (full HDR float)."))
+                          "linear OpenEXR image sequences (full HDR float), "
+                          "or source-encoded RGB with a source color policy."))
     ap.add_argument("--exr_dtype", choices=("half", "float"), default="half",
                     help="EXR pixel type for --output_format exr. Default: half.")
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
@@ -117,9 +130,22 @@ def main():
                     default=2048)
     args = ap.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
+    hann_chunk = args.hann_chunk if args.hann_chunk is not None else 80
+    hann_stride = args.hann_stride if args.hann_stride is not None else max(1, hann_chunk // 2)
+    try:
+        validate_hann_window(hann_chunk, hann_stride)
+        validate_destination(Path(args.output_dir), args.input)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     require_ffmpeg(args.ffmpeg_bin)
+    if not Path(args.input).is_dir():
+        validate_video(args.input)
+        if args.input_color_space != "legacy" or args.color_output == "source_rgb":
+            # Validate the actual decode before allocating GPU/model memory.
+            # run_inference reuses this cached count when calculating ranges.
+            count_decoded_video_frames(args.input, args.ffmpeg_bin)
+    device = select_device()
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
     writer_cfg = WriterConfig(
@@ -133,8 +159,8 @@ def main():
     )
     # With no explicit memory settings, pick them per clip from free GPU memory.
     auto_vram = args.hann_chunk is None and args.hann_stride is None and not args.low_vram
-    hann_chunk = args.hann_chunk if args.hann_chunk is not None else 80
-    hann_stride = args.hann_stride if args.hann_stride is not None else max(1, hann_chunk // 2)
+    if auto_vram:
+        configure_auto_memory(device)
     infer_cfg = InferenceConfig(
         hann_chunk=hann_chunk,
         hann_stride=hann_stride,
@@ -160,13 +186,17 @@ def main():
         linear_contrast=args.linear_contrast,
         linear_contrast_pivot=args.linear_contrast_pivot,
         frame_dir_fps=args.frame_dir_fps,
+        input_color_space=args.input_color_space,
+        color_output=args.color_output,
+        input_range=args.input_range,
         frame_dir_linear=args.frame_dir_linear,
         cutout_linear=args.cutout_linear,
         despill_strength=args.despill_strength,
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
     )
-    model = load_model(paths, device="cuda")
+    infer_cfg.validate()
+    model = load_model(paths, device=device)
     run_inference(
         model,
         args.input,

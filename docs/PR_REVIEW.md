@@ -1,0 +1,60 @@
+# CorridorKey2.0 pull request review
+
+Survey of all 20 PRs returned by GitHub's public `pulls?state=all&per_page=100` API on 2026-11-13: #1 and #3–21 (#2 is absent). Metadata and changed-file patches were saved under `review/` during the review. PR authors' test results below are attributed as claims; this review inspected the submitted metadata and diffs, and did not independently reproduce GPU, Mac, Windows, cloud, or visual-quality measurements.
+
+The current branch retains the relevant original commits in history. Integrated PRs are #4, #6, #8, #9, #15 and #20. For #15, its original changes remain split across the commits listed below. The optional MPSGraph binary is not included in the packaged app, so the package uses PyTorch MPS SDPA. When the binary is built, current code enables it unless `CORRIDORKEY_MPS_NATIVE_ATTENTION=0` is set.
+
+| PR | State | Change | Decision and evidence / reason |
+|---:|---|---|---|
+| [#1](https://github.com/nikopueringer/CorridorKey2.0/pull/1) | Closed | README credit spelling | No code change. |
+| [#3](https://github.com/nikopueringer/CorridorKey2.0/pull/3) | Open | Python version and Torch requirements docs | Minor setup update; no urgent implementation. |
+| [#4](https://github.com/nikopueringer/CorridorKey2.0/pull/4) | Open | Natural sorting and case-insensitive image-sequence extensions | **Integrated.** Prevents silent temporal reordering and missed uppercase image extensions. Original commit retained: `cbb8d5c`. |
+| [#5](https://github.com/nikopueringer/CorridorKey2.0/pull/5) | Closed | Gradio browser UI around `infer.py` | Alternate GUI: subprocess, streamed logs, cancel and browser previews. Defer; Qt GUI #8 is the chosen base. Remote listen should remain authenticated. |
+| [#6](https://github.com/nikopueringer/CorridorKey2.0/pull/6) | Open | Preserve RMSNorm output dtype under newer autocast | **Integrated.** Fixes reported PyTorch 2.14 dtype mismatch that can abort attention; two-line cast. Original commit retained: `599f7e3`. Author's CUDA-only tests should skip or select an available backend on CPU-only machines. Prerequisite for #11/#13 reports. |
+| [#7](https://github.com/nikopueringer/CorridorKey2.0/pull/7) | Open | Linux ROCm GPU detection/selection | Defer unless AMD Linux is a target. Author reports RX 9070 XT end-to-end run; real ROCm wheel/device coverage remains needed. Pair with #6; #13 handles a distinct SDPA OOM. |
+| [#8](https://github.com/nikopueringer/CorridorKey2.0/pull/8) | Open | Qt desktop GUI | **Integrated as GUI base.** Separate queue, preview, settings and subprocess runner. Original commit retained: `f666d7b`. |
+| [#9](https://github.com/nikopueringer/CorridorKey2.0/pull/9) | Open | Freeze inference model and store Linear/Conv weights in BF16 | **Integrated.** Reduces parameter storage and avoids grad-enabled autocast weight caching; assumes inference-only model use. Auto-VRAM profiles become conservative. Original commit retained: `4cef274`. |
+| [#10](https://github.com/nikopueringer/CorridorKey2.0/pull/10) | Open | First Apple MPS implementation | Superseded by the more focused MPS path in #15. Its MPS area-resize approach may be reconsidered if resize is measured as a bottleneck. |
+| [#11](https://github.com/nikopueringer/CorridorKey2.0/pull/11) | Open | Auto-VRAM headroom and OOM retry | Defer. Changes global profile selection and retry lifecycle; author validation covered one GPU/resolution, and the branch depends on #6 for modern low-VRAM dtype behavior. Revisit with target-device profile tests. |
+| [#12](https://github.com/nikopueringer/CorridorKey2.0/pull/12) | Closed | Broad audit and desktop/workflow branch | Do not cherry-pick. Hundreds of changes spanning a separate worker, UI, corrections, cache, benchmarks and product process; select individual UX ideas only after a separate scope/review. |
+| [#13](https://github.com/nikopueringer/CorridorKey2.0/pull/13) | Open | Bound SDPA score memory on ROCm devices without fused kernels | Defer unless supporting those AMD GPUs. Depends on #6, leaves CUDA untouched and reports fixing RX 5700 XT OOM; no NVIDIA end-to-end run, some broadcast shapes pass through, and fullgraph compilation is not supported. |
+| [#14](https://github.com/nikopueringer/CorridorKey2.0/pull/14) | Open | Move setup to `uv` and lock dependencies | Useful setup improvement, defer until exact Mac/native-arm64 and current supported accelerator lock resolution is checked. Author reports Linux/Windows setup tests; Mac and full launcher inference were not tested. |
+| [#15](https://github.com/nikopueringer/CorridorKey2.0/pull/15) | Open | Apple Silicon MPS and bounded spatial attention | **Integrated.** Best Mac path in this survey. Adds MPS device/memory helpers and 2D window batching. Author reports full M2 Air/24 GiB 4K inference; ~4-hour runtime and Hann 1/1 limit temporal context. Author reports MPSGraph output differences vs PyTorch MPS; binary is absent from packaged app, and built native attention can be disabled with `CORRIDORKEY_MPS_NATIVE_ATTENTION=0`. Original commits retained: `fc8fc84`, `5303516`, `0f77f94`, `5498410`. |
+| [#16](https://github.com/nikopueringer/CorridorKey2.0/pull/16) | Closed | Remote SSH/Runpod inference | Optional workflow for remote GPUs and clip batches. Defer unless remote processing is desired; moves media to remote hosts and adds provider/cost lifecycle. Author reports offline tests and live SSH/Runpod runs. |
+| [#17](https://github.com/nikopueringer/CorridorKey2.0/pull/17) | Open | Full Rust/CubeCL/Burn engine plus dependency migration | Do not adopt for the current product. Large second runtime; its own known issue is silent wrong output (including zero alpha) when GPU memory runs out. Mac/WGPU is explicitly untested. |
+| [#18](https://github.com/nikopueringer/CorridorKey2.0/pull/18) | Open | Broad opt-in performance suite | Defer wholesale. Many runtime, model-block, I/O and allocator changes make regression isolation difficult; extract individually justified components only. |
+| [#19](https://github.com/nikopueringer/CorridorKey2.0/pull/19) | Closed draft | PTX kernels and per-backend VRAM planning | No cherry-pick. Published file diff only changes `runtime.py` and references a `ptx` module absent from its changed-file list; the draft is not self-contained against master. NVIDIA-specific performance claims need the actual loader/kernel payload and local parity runs. |
+| [#20](https://github.com/nikopueringer/CorridorKey2.0/pull/20) | Open | LUT preprocessing for unscaled uint8 frames | **Integrated.** Equivalence tests compare LUT outputs to the original float path; a narrow frame-directory gate preserves prior behavior when adjusted metadata is passed directly. Original commit retained: `6be9d5f`. |
+| [#21](https://github.com/nikopueringer/CorridorKey2.0/pull/21) | Open | Consolidation branch labelled “Do Not Merge” | Do not merge wholesale; use as a map to separately reviewed PRs only. |
+
+## Follow-up review: 2026-11-14
+
+[PR #23](https://github.com/nikopueringer/CorridorKey2.0/pull/23), by
+`philipmiesbauer`, was reviewed at `d753c8605f7673e69e315357c810500f9016495e`.
+Its five-file change adds automatic CUDA/MPS selection, device-aware runtime
+helpers, a CPU fallback for non-divisible area resize, an explicit `--device`
+option, an RVM-download certificate fallback, and `.venv` launcher preference.
+
+- **Adapted:** the certificate fallback for macOS Python installations without
+  a default CA file. Our downloader starts with the verified platform context
+  and adds certifi roots, preserving existing system/custom trust directories.
+  `certifi` is an explicit dependency. Offline tests cover trust retention,
+  the context passed to `urlopen`, and checkpoint checksum validation.
+- **Already covered:** automatic MPS selection, device-aware operations, area
+  resize fallback and `.venv` discovery are present through the existing Mac
+  integration. There is no reason to replace them wholesale.
+- **Not adopted:** its MPS memory planner treats the full recommended working
+  set as available and does not include our conservative budget or spatial
+  attention batching. Explicit device/CPU selection is a separate feature;
+  its fixed 8 GB CPU budget is not an available-memory measurement.
+- **Validation limit:** the author reports weight downloads, model loading and
+  successful alpha/foreground video inference. No automated checks were
+  attached to the reviewed head, and no tests, GUI, app packaging, OFX or
+  attention implementation changes are included. This PR does not resolve our
+  CPU-reference attention failures on native macOS 26.
+
+## Decision notes
+
+- The main safe candidates adopted are focused correctness, memory, GUI and platform changes: #4, #6, #8, #9, #15 and #20.
+- For the Mac package, MPSGraph attention remains an optional build artifact. The packaged app omits it and thus uses the PyTorch fallback by default. If the native library is present, current runtime code loads it by default; set `CORRIDORKEY_MPS_NATIVE_ATTENTION=0` to force PyTorch SDPA.
+- Author-reported hardware and quality results are not this review's independent verification. GPU, Mac, CUDA regression, visual-quality and packaging acceptance should be tracked separately.

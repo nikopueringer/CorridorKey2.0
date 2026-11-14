@@ -16,7 +16,74 @@ Led by Ale Alvaro, we now have a plugin (and stand-alone app) available for almo
 Any business or research inquiries for Zac can be directed to z.brooks.harris@gmail.com
 
 
+## Community desktop builds and Resolve OpenFX (experimental)
+
+This branch continues the desktop GUI from PR #8 and adds Linux x86-64 and Apple Silicon
+OpenFX bridges for DaVinci Resolve. See [Linux setup, build and usage](ofx/README.md).
+The GUI retains temporal processing and hints; OFX currently keys individual
+frames through a separate local CUDA or MPS worker. This community build is separate
+from the official paid plugin. Apple Silicon packaging includes bundled Python
+and an MPS backend: [Mac build, validation status and usage](packaging/macos/README.md).
+See the [review of all upstream pull requests](docs/PR_REVIEW.md) for integration decisions.
+
+The desktop queue shows live elapsed processing time and phase-specific estimates
+after enough completed work is available. Completion records total and keying time
+per clip, plus the queue's total time. Low-VRAM stage-two inference has its own
+progress; finishing the encoder does not display an unsupported ETA.
+
+Render results are published as complete generations: cancellation and write errors
+preserve the last successful output. New source-specific output folder names avoid
+collisions between identically named clips. See [output storage and compatibility](docs/CAMERA_COLOR.md).
+
 ## Setup
+
+### Apple Silicon Mac
+
+Use native arm64 Python 3.12, a macOS version with Metal bfloat16 support
+(macOS 14 or later), and `ffmpeg` on your `PATH`. From the repository root:
+
+```sh
+python3.12 -m venv venv
+source venv/bin/activate
+pip install torch==2.9.1 torchvision==0.24.1
+pip install -r requirements.txt
+python scripts/download_weights.py
+python infer.py --input /path/to/clip.mp4 --output_dir /path/to/output
+```
+
+The existing CLI automatically selects Metal when CUDA is unavailable.
+Metal uses synchronous uploads and the CPU area-resize operator for dimensions
+unsupported by Metal's adaptive pooling. The CUDA execution path is unchanged.
+The Mac dependencies select a tested OpenCV decoder to avoid corrupted final
+rows in YUV444 video with the older Apple Silicon wheel.
+
+On macOS 15 or later, optional native MPSGraph attention reduces attention
+memory and improves throughput. With Apple's command-line developer tools
+installed, build it in the same Python environment before running inference:
+
+```sh
+python scripts/build_mps_attention.py
+```
+
+Rebuild after changing PyTorch or moving the environment. A missing or
+incompatible library uses the bounded PyTorch path. Set
+`CORRIDORKEY_MPS_NATIVE_ATTENTION=0` to disable native attention for comparisons.
+
+Automatic memory selection reserves headroom for unified memory and reduces
+foundation, attention, and MLP batches on smaller Macs. Existing explicit Hann
+and low-VRAM settings retain control. Metal allocation limits remain enabled;
+explicit `PYTORCH_MPS_HIGH_WATERMARK_RATIO` / `PYTORCH_MPS_LOW_WATERMARK_RATIO`
+settings are respected.
+
+A 302-frame 3840×2160 clip completed on a 24 GiB M2 with native attention:
+3 h 58 min end to end, 11.96 GiB sampled inference-process peak (excluding
+separate FFmpeg processes). Both output videos decoded all 302 frames at native
+resolution. Model weights and resolution were preserved. This remains a slow
+offline workflow; automatic settings can use shorter temporal context.
+Native attention can introduce floating-point differences, and identical
+CUDA/Metal pixels are not guaranteed.
+
+### NVIDIA CUDA
 
 You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
 for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
@@ -70,6 +137,47 @@ You can also start the same guided session directly:
 ```
 python run_interactive.py /path/to/clip.mp4
 ```
+
+## Desktop App
+
+There is also a desktop UI in `gui/`: a clip queue, a viewer for the input and
+every output, and the settings described below as controls. It runs the same
+`infer.py` underneath, one clip at a time.
+
+![The CorridorKey 2.0 desktop UI](gui/screenshot.png)
+
+- **Windows:** double-click `gui/CorridorKey.bat`, or drag clips onto it
+- **Linux:** `gui/CorridorKey.sh`
+- **Any platform:** `python -m gui [clip_or_folder ...]` from the repository root
+
+Install the GUI toolkit with `pip install -r requirements-gui.txt` (the Windows launcher can also install it on first run). To add a Start Menu entry
+and a desktop shortcut with the CorridorKey icon (an applications-menu entry on
+Linux), run this once:
+
+```
+python -m gui.shortcut
+```
+
+Companion hint files are picked up the same way the drag-and-drop launcher
+finds them, and each clip's hint can be changed in the inspector.
+
+Click **Run queue** to render standalone clips. **Start OFX engine** serves the
+Resolve plugin. The viewer shows the decoded video FPS, frame count, size and
+duration; **Sequence FPS** only controls folders of still frames. The **Cutout**
+tab displays straight alpha over a checker, including ProRes 4444 output.
+
+Some DNxHR 444 files use variable Adaptive Color Transform (ACT), which the
+FFmpeg decoder does not support. Such files can otherwise decode with a strong
+pink/green cast despite returning frames successfully. The app and CLI reject
+this known decoder error. Export those clips from Resolve as ProRes 4444 or EXR,
+or use the OFX effect within Resolve at a supported processing resolution.
+
+## Camera log inputs
+
+Each queued clip can select a camera transfer function and gamut. Mathematical
+conversion feeds the model linear working RGB while preserving its HDR input
+contract. Choose processed working colour, processed camera colour, or original
+RGB with the new alpha. See [camera profiles, precision and output interpretation](docs/CAMERA_COLOR.md).
 
 ## Quick Start
 
